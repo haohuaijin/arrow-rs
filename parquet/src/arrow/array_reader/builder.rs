@@ -133,6 +133,36 @@ impl<'a> ArrayReaderBuilder<'a> {
         Ok(reader)
     }
 
+    /// Create an [`ArrayReader`] optimized for predicate evaluation.
+    ///
+    /// This method attempts to preserve dictionary encoding for columns that would benefit
+    /// from dictionary-based predicate evaluation, even if the user's schema specifies
+    /// plain types (e.g., Utf8 instead of Dictionary<Int32, Utf8>).
+    ///
+    /// This is particularly beneficial for predicates that implement `evaluate_dictionary()`
+    /// as it allows evaluating the predicate once on dictionary values instead of on every row.
+    ///
+    /// # Dictionary Preservation
+    ///
+    /// Dictionary encoding preservation depends on the parquet file structure:
+    /// - **Pure dictionary pages**: Optimization works, predicate evaluates on dictionary
+    /// - **Mixed pages** (dictionary + plain): Reader falls back to plain encoding
+    /// - **Multiple column chunks**: Dictionary may not be preserved across chunks
+    ///
+    /// This graceful fallback ensures correctness while providing optimization when possible.
+    pub fn build_predicate_array_reader(
+        &self,
+        field: Option<&ParquetField>,
+        mask: &ProjectionMask,
+    ) -> Result<Box<dyn ArrayReader>> {
+        let reader = field
+            .and_then(|field| self.build_predicate_reader(field, mask).transpose())
+            .transpose()?
+            .unwrap_or_else(|| make_empty_array_reader(self.num_rows()));
+
+        Ok(reader)
+    }
+
     /// Return the total number of rows
     fn num_rows(&self) -> usize {
         self.row_groups.num_rows()
@@ -179,6 +209,123 @@ impl<'a> ArrayReaderBuilder<'a> {
                 DataType::FixedSizeList(_, _) => self.build_fixed_size_list_reader(field, mask),
                 d => unimplemented!("reading group type {} not implemented", d),
             },
+        }
+    }
+
+    /// Build a reader optimized for predicate evaluation, preserving dictionary encoding
+    fn build_predicate_reader(
+        &self,
+        field: &ParquetField,
+        mask: &ProjectionMask,
+    ) -> Result<Option<Box<dyn ArrayReader>>> {
+        match &field.field_type {
+            ParquetFieldType::Primitive { col_idx, primitive_type } => {
+                if !mask.leaf_included(*col_idx) {
+                    return Ok(None);
+                }
+
+                let physical_type = primitive_type.get_physical_type();
+
+                // Only optimize dictionary encoding for byte array types
+                if (physical_type == PhysicalType::BYTE_ARRAY ||
+                    physical_type == PhysicalType::FIXED_LEN_BYTE_ARRAY) &&
+                   !matches!(field.arrow_type, DataType::Dictionary(_, _)) {
+
+                    // Override the type to use dictionary encoding for predicate evaluation
+                    let dict_type = match &field.arrow_type {
+                        DataType::Utf8 => Some(DataType::Dictionary(
+                            Box::new(DataType::Int32),
+                            Box::new(DataType::Utf8),
+                        )),
+                        DataType::Binary => Some(DataType::Dictionary(
+                            Box::new(DataType::Int32),
+                            Box::new(DataType::Binary),
+                        )),
+                        DataType::LargeUtf8 => Some(DataType::Dictionary(
+                            Box::new(DataType::Int32),
+                            Box::new(DataType::LargeUtf8),
+                        )),
+                        DataType::LargeBinary => Some(DataType::Dictionary(
+                            Box::new(DataType::Int32),
+                            Box::new(DataType::LargeBinary),
+                        )),
+                        DataType::Utf8View => Some(DataType::Dictionary(
+                            Box::new(DataType::Int32),
+                            Box::new(DataType::Utf8),
+                        )),
+                        DataType::BinaryView => Some(DataType::Dictionary(
+                            Box::new(DataType::Int32),
+                            Box::new(DataType::Binary),
+                        )),
+                        _ => None,
+                    };
+
+                    if let Some(dict_type) = dict_type {
+                        // Create a dictionary reader for predicate evaluation
+                        // This preserves dictionary encoding so evaluate_dictionary() can be called
+                        let column_desc = Arc::new(ColumnDescriptor::new(
+                            primitive_type.clone(),
+                            field.def_level,
+                            field.rep_level,
+                            ColumnPath::new(vec![]),
+                        ));
+
+                        let page_iterator = self.row_groups.column_chunks(*col_idx)?;
+
+                        // Create dictionary reader with the dictionary type
+                        // This reader will:
+                        // 1. Preserve dictionary encoding when all pages are dictionary-encoded
+                        // 2. Fall back to plain encoding if pages are mixed or non-dictionary
+                        // 3. Return Dictionary<Int32, Utf8> type (or similar) for predicate evaluation
+                        return make_byte_array_dictionary_reader(
+                            page_iterator,
+                            column_desc,
+                            Some(dict_type),
+                        ).map(Some);
+                    }
+                }
+
+                // For non-optimizable types, use standard builder
+                self.build_reader(field, mask)
+            }
+            ParquetFieldType::Group { .. } => {
+                // For struct types, recursively process children
+                // This is crucial for handling the top-level struct that wraps actual columns
+                match &field.arrow_type {
+                    DataType::Struct(fields) => {
+                        let children = field.children().unwrap();
+                        let mut readers = Vec::with_capacity(children.len());
+                        let mut builder = SchemaBuilder::with_capacity(children.len());
+
+                        for (arrow_field, parquet_field) in fields.iter().zip(children) {
+                            if let Some(reader) = self.build_predicate_reader(parquet_field, mask)? {
+                                // Use the reader's actual data type (may be Dictionary)
+                                let child_type = reader.get_data_type().clone();
+                                builder.push(arrow_field.as_ref().clone().with_data_type(child_type));
+                                readers.push(reader);
+                            }
+                        }
+
+                        if readers.is_empty() {
+                            return Ok(None);
+                        }
+
+                        Ok(Some(Box::new(StructArrayReader::new(
+                            DataType::Struct(builder.finish().fields),
+                            readers,
+                            field.def_level,
+                            field.rep_level,
+                            field.nullable,
+                        ))))
+                    }
+                    _ => {
+                        // For other group types (List, Map), use standard builder
+                        self.build_reader(field, mask)
+                    }
+                }
+            }
+            // For virtual columns, use standard builder
+            _ => self.build_reader(field, mask),
         }
     }
 

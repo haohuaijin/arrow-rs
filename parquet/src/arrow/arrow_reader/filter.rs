@@ -16,7 +16,7 @@
 // under the License.
 
 use crate::arrow::ProjectionMask;
-use arrow_array::{BooleanArray, RecordBatch};
+use arrow_array::{ArrayRef, BooleanArray, RecordBatch};
 use arrow_schema::ArrowError;
 use std::fmt::{Debug, Formatter};
 
@@ -44,6 +44,69 @@ pub trait ArrowPredicate: Send + 'static {
     /// * `true`:the row should be returned
     /// * `false` or `null`: the row should not be returned
     fn evaluate(&mut self, batch: RecordBatch) -> Result<BooleanArray, ArrowError>;
+
+    /// Optionally evaluate this predicate directly on dictionary values
+    ///
+    /// If this method returns `Some`, the predicate can be optimized for dictionary-encoded
+    /// columns by evaluating the predicate once on the dictionary values and then mapping
+    /// the dictionary indices to the corresponding boolean results.
+    ///
+    /// This optimization is particularly beneficial for string/binary columns with dictionary
+    /// encoding, where the same predicate would otherwise be evaluated many times on
+    /// repeated values.
+    ///
+    /// The `dictionary` parameter is the dictionary array (the unique values).
+    /// Returns a [`BooleanArray`] with the same length as the dictionary, where each element
+    /// indicates whether that dictionary value satisfies the predicate.
+    ///
+    /// Default implementation returns `None`, indicating that dictionary optimization is not supported.
+    ///
+    /// # Important Note on When This Is Called
+    ///
+    /// This optimization only applies when the RecordBatch actually contains Dictionary-typed arrays.
+    /// If a Parquet file uses dictionary encoding but is read with a schema specifying plain types
+    /// (e.g., Utf8 instead of Dictionary<Int32, Utf8>), the dictionary will be decoded before
+    /// reaching the predicate, and this method will not be invoked.
+    ///
+    /// The optimization is automatically enabled when:
+    /// - The Parquet file uses dictionary encoding (RLE_DICTIONARY or PLAIN_DICTIONARY)
+    /// - The reader preserves the dictionary encoding (which it does by default)
+    ///
+    /// # Example
+    ///
+    /// ```rust,ignore
+    /// use arrow_array::{ArrayRef, BooleanArray, StringArray};
+    /// use arrow_array::cast::AsArray;
+    /// use arrow_compute::kernels::cmp::eq;
+    /// use arrow_schema::ArrowError;
+    ///
+    /// struct MyPredicate;
+    ///
+    /// impl ArrowPredicate for MyPredicate {
+    ///     fn projection(&self) -> &ProjectionMask {
+    ///         // ... return projection mask
+    ///     }
+    ///
+    ///     fn evaluate(&mut self, batch: RecordBatch) -> Result<BooleanArray, ArrowError> {
+    ///         // Standard evaluation on the full batch
+    ///         let column = batch.column(0).as_string::<i32>();
+    ///         eq(column, &StringArray::new_scalar("target_value"))
+    ///     }
+    ///
+    ///     fn evaluate_dictionary(&mut self, dictionary: ArrayRef) -> Option<Result<BooleanArray, ArrowError>> {
+    ///         // Optimized evaluation on dictionary values only
+    ///         // This will be called once per dictionary, instead of once per row
+    ///         let dict_values = dictionary.as_string::<i32>();
+    ///         Some(eq(dict_values, &StringArray::new_scalar("target_value")))
+    ///     }
+    /// }
+    /// ```
+    fn evaluate_dictionary(
+        &mut self,
+        _dictionary: ArrayRef,
+    ) -> Option<Result<BooleanArray, ArrowError>> {
+        None
+    }
 }
 
 /// An [`ArrowPredicate`] created from an [`FnMut`] and a [`ProjectionMask`]

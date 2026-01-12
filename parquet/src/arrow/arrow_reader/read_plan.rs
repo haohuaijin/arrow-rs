@@ -25,7 +25,8 @@ use crate::arrow::arrow_reader::{
     ArrowPredicate, ParquetRecordBatchReader, RowSelection, RowSelectionCursor, RowSelector,
 };
 use crate::errors::{ParquetError, Result};
-use arrow_array::Array;
+use arrow_array::{Array, cast::AsArray};
+use arrow_schema::DataType;
 use arrow_select::filter::prep_null_mask_filter;
 use std::collections::VecDeque;
 
@@ -143,6 +144,17 @@ impl ReadPlanBuilder {
     /// Note: pre-existing selections may come from evaluating a previous predicate
     /// or if the [`ParquetRecordBatchReader`] specified an explicit
     /// [`RowSelection`] in addition to one or more predicates.
+    ///
+    /// # Dictionary Encoding Optimization
+    ///
+    /// This method now automatically uses dictionary-encoded readers for predicate evaluation
+    /// when beneficial, even if the user schema requests plain types (e.g., Utf8 instead of
+    /// Dictionary<Int32, Utf8>). This allows predicates implementing `evaluate_dictionary()`
+    /// to evaluate once on the dictionary values instead of on every row, significantly
+    /// improving performance for string/binary columns with dictionary encoding.
+    ///
+    /// The optimization is transparent - the final output still matches the user's requested
+    /// schema. The dictionary encoding is only used internally during predicate evaluation.
     pub fn with_predicate(
         mut self,
         array_reader: Box<dyn ArrayReader>,
@@ -153,7 +165,18 @@ impl ReadPlanBuilder {
         for maybe_batch in reader {
             let maybe_batch = maybe_batch?;
             let input_rows = maybe_batch.num_rows();
-            let filter = predicate.evaluate(maybe_batch)?;
+
+            // Try dictionary optimization first
+            // The array_reader may be dictionary-encoded if built with PredicateArrayReaderBuilder
+            let filter = if let Some(filter) =
+                Self::try_evaluate_dictionary_predicate(&maybe_batch, predicate)?
+            {
+                filter
+            } else {
+                // Fallback to standard evaluation
+                predicate.evaluate(maybe_batch)?
+            };
+
             // Since user supplied predicate, check error here to catch bugs quickly
             if filter.len() != input_rows {
                 return Err(arrow_err!(
@@ -173,6 +196,75 @@ impl ReadPlanBuilder {
             None => Some(raw),
         };
         Ok(self)
+    }
+
+    /// Try to evaluate the predicate on dictionary-encoded columns for optimization
+    ///
+    /// Returns `Ok(Some(BooleanArray))` if dictionary optimization was successful,
+    /// `Ok(None)` if optimization is not applicable, or `Err` if an error occurred.
+    fn try_evaluate_dictionary_predicate(
+        batch: &arrow_array::RecordBatch,
+        predicate: &mut dyn ArrowPredicate,
+    ) -> Result<Option<arrow_array::BooleanArray>> {
+        use arrow_array::BooleanArray;
+        use arrow_buffer::BooleanBufferBuilder;
+
+        // Only optimize if there's exactly one column (the most common case for predicates)
+        if batch.num_columns() != 1 {
+            return Ok(None);
+        }
+
+        let column = batch.column(0);
+
+        // Check if this is a dictionary-encoded column
+        let dict_array = match column.data_type() {
+            DataType::Dictionary(_, _) => column,
+            _ => return Ok(None),
+        };
+
+        // Try to evaluate on the dictionary
+        let dict_data = dict_array.to_data();
+        if dict_data.child_data().is_empty() {
+            return Ok(None);
+        }
+
+        let dictionary = arrow_array::make_array(dict_data.child_data()[0].clone());
+
+        // Ask the predicate if it can evaluate on the dictionary
+        let dict_filter = match predicate.evaluate_dictionary(dictionary) {
+            Some(result) => result?,
+            None => return Ok(None),
+        };
+
+        // Now map dictionary indices to boolean results
+        let num_rows = dict_array.len();
+        let mut result_builder = BooleanBufferBuilder::new(num_rows);
+
+        // Get the keys (indices) from the dictionary array as usize
+        let dict_trait = dict_array.as_any_dictionary();
+        let normalized_keys = dict_trait.normalized_keys();
+
+        // Map each key to its corresponding boolean value
+        for i in 0..num_rows {
+            if dict_array.is_null(i) {
+                // Null values in the data should map to false (filtered out)
+                result_builder.append(false);
+            } else {
+                // Get the dictionary index for this row
+                let key_val = normalized_keys[i];
+
+                // Look up the predicate result for this dictionary value
+                if key_val < dict_filter.len() {
+                    let passes = dict_filter.value(key_val);
+                    result_builder.append(passes);
+                } else {
+                    // Invalid key - should not happen, but handle gracefully
+                    result_builder.append(false);
+                }
+            }
+        }
+
+        Ok(Some(BooleanArray::new(result_builder.finish(), None)))
     }
 
     /// Create a final `ReadPlan` the read plan for the scan

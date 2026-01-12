@@ -432,10 +432,11 @@ impl RowGroupReaderBuilder {
 
                 let cache_options = filter_info.cache_builder().producer();
 
+                // Use dictionary-preserving reader for predicate evaluation
                 let array_reader = ArrayReaderBuilder::new(&row_group, &self.metrics)
                     .with_cache_options(Some(&cache_options))
                     .with_parquet_metadata(&self.metadata)
-                    .build_array_reader(self.fields.as_deref(), predicate.projection())?;
+                    .build_predicate_array_reader(self.fields.as_deref(), predicate.projection())?;
 
                 plan_builder =
                     plan_builder.with_predicate(array_reader, filter_info.current_mut())?;

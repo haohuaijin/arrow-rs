@@ -1135,9 +1135,10 @@ impl<T: ChunkReader + 'static> ParquetRecordBatchReaderBuilder<T> {
                 let mut cache_projection = predicate.projection().clone();
                 cache_projection.intersect(&projection);
 
+                // Use dictionary-preserving reader for predicate evaluation
                 let array_reader = ArrayReaderBuilder::new(&reader, &metrics)
                     .with_parquet_metadata(&reader.metadata)
-                    .build_array_reader(fields.as_deref(), predicate.projection())?;
+                    .build_predicate_array_reader(fields.as_deref(), predicate.projection())?;
 
                 plan_builder = plan_builder.with_predicate(array_reader, predicate.as_mut())?;
             }
