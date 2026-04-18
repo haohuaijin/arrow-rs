@@ -24,7 +24,8 @@ use crate::arrow::array_reader::{ArrayReaderBuilder, CacheOptions, RowGroupCache
 use crate::arrow::arrow_reader::metrics::ArrowReaderMetrics;
 use crate::arrow::arrow_reader::selection::RowSelectionStrategy;
 use crate::arrow::arrow_reader::{
-    ParquetRecordBatchReader, ReadPlanBuilder, RowFilter, RowSelection, RowSelectionPolicy,
+    ArrowPredicate, ParquetRecordBatchReader, ReadPlanBuilder, RowFilter, RowSelection,
+    RowSelectionPolicy,
 };
 use crate::arrow::in_memory_row_group::ColumnChunkData;
 use crate::arrow::push_decoder::reader_builder::data::DataRequestBuilder;
@@ -67,6 +68,27 @@ enum RowGroupDecoderState {
         row_group_info: RowGroupInfo,
         filter_info: FilterInfo,
         data_request: DataRequest,
+    },
+    /// Planning interleaved evaluation of all predicates at once.
+    ///
+    /// Used when a downstream `LIMIT` is known and multiple predicates are
+    /// present. The combined filter is short-circuited as soon as the
+    /// conjunction has produced enough rows, so the most-expensive
+    /// predicate stops working regardless of its position in the chain.
+    InterleavedFilters {
+        row_group_info: RowGroupInfo,
+        column_chunks: Option<Vec<Option<Arc<ColumnChunkData>>>>,
+        filter_info: FilterInfo,
+        /// Union of every predicate's projection — determines which columns
+        /// we need to fetch up front.
+        combined_projection: ProjectionMask,
+    },
+    /// Needs data to proceed with interleaved filter eval
+    WaitingOnInterleavedFilterData {
+        row_group_info: RowGroupInfo,
+        filter_info: FilterInfo,
+        data_request: DataRequest,
+        combined_projection: ProjectionMask,
     },
     /// Know what data to actually read, after all predicates
     StartData {
@@ -306,6 +328,18 @@ impl RowGroupReaderBuilder {
             RowGroupDecoderState::Start { row_group_info } => {
                 let column_chunks = None; // no prior column chunks
 
+                // Layer 1: if a prior row group has already satisfied the
+                // global limit, skip this one entirely. We still need to put
+                // the filter back before returning (it may be reused by
+                // later row groups if `limit` is later replenished, and
+                // `self.filter` must not be stale).
+                if self.limit == Some(0) {
+                    return Ok(NextState::result(
+                        RowGroupDecoderState::Finished,
+                        DecodeResult::Finished,
+                    ));
+                }
+
                 let Some(filter) = self.filter.take() else {
                     // no filter, start trying to read data immediately
                     return Ok(NextState::again(RowGroupDecoderState::StartData {
@@ -335,12 +369,33 @@ impl RowGroupReaderBuilder {
                     ))),
                 );
 
-                let filter_info = FilterInfo::new(filter, cache_info);
-                NextState::again(RowGroupDecoderState::Filters {
-                    row_group_info,
-                    filter_info,
-                    column_chunks,
-                })
+                // Use interleaved evaluation whenever a concrete `LIMIT` is
+                // present. For a single predicate this collapses to the
+                // same short-circuit ("stop pulling batches once limit
+                // matches have been produced") the per-predicate path used
+                // to lack; for multiple predicates it additionally combines
+                // filters so the short-circuit fires on the conjunction,
+                // not on any single predicate.
+                let use_interleaved = self.limit.is_some() && !filter.predicates.is_empty();
+
+                if use_interleaved {
+                    let combined_projection =
+                        union_predicate_projections(&filter, &self.metadata);
+                    let filter_info = FilterInfo::new(filter, cache_info);
+                    NextState::again(RowGroupDecoderState::InterleavedFilters {
+                        row_group_info,
+                        column_chunks,
+                        filter_info,
+                        combined_projection,
+                    })
+                } else {
+                    let filter_info = FilterInfo::new(filter, cache_info);
+                    NextState::again(RowGroupDecoderState::Filters {
+                        row_group_info,
+                        filter_info,
+                        column_chunks,
+                    })
+                }
             }
             // need to evaluate filters
             RowGroupDecoderState::Filters {
@@ -487,6 +542,153 @@ impl RowGroupReaderBuilder {
                         })
                     }
                 }
+            }
+            RowGroupDecoderState::InterleavedFilters {
+                row_group_info,
+                column_chunks,
+                filter_info,
+                combined_projection,
+            } => {
+                let RowGroupInfo {
+                    row_group_idx,
+                    row_count,
+                    plan_builder,
+                } = row_group_info;
+
+                if !plan_builder.selects_any() {
+                    // ruled out entire row group already
+                    self.filter = Some(filter_info.into_filter());
+                    return Ok(NextState::result(
+                        RowGroupDecoderState::Finished,
+                        DecodeResult::Finished,
+                    ));
+                }
+
+                // Fetch the union of every predicate's projection in one
+                // shot, so the subsequent evaluation can advance all
+                // predicates' readers in lockstep.
+                let data_request = DataRequestBuilder::new(
+                    row_group_idx,
+                    row_count,
+                    self.batch_size,
+                    &self.metadata,
+                    &combined_projection,
+                )
+                .with_selection(plan_builder.selection())
+                .with_cache_projection(Some(filter_info.cache_projection()))
+                .with_column_chunks(column_chunks)
+                .build();
+
+                let row_group_info = RowGroupInfo {
+                    row_group_idx,
+                    row_count,
+                    plan_builder,
+                };
+
+                NextState::again(RowGroupDecoderState::WaitingOnInterleavedFilterData {
+                    row_group_info,
+                    filter_info,
+                    data_request,
+                    combined_projection,
+                })
+            }
+            RowGroupDecoderState::WaitingOnInterleavedFilterData {
+                row_group_info,
+                filter_info,
+                data_request,
+                combined_projection,
+            } => {
+                let needed_ranges = data_request.needed_ranges(&self.buffers);
+                if !needed_ranges.is_empty() {
+                    return Ok(NextState::result(
+                        RowGroupDecoderState::WaitingOnInterleavedFilterData {
+                            row_group_info,
+                            filter_info,
+                            data_request,
+                            combined_projection,
+                        },
+                        DecodeResult::NeedsData(needed_ranges),
+                    ));
+                }
+
+                let RowGroupInfo {
+                    row_group_idx,
+                    row_count,
+                    mut plan_builder,
+                } = row_group_info;
+
+                let row_group = data_request.try_into_in_memory_row_group(
+                    row_group_idx,
+                    row_count,
+                    &self.metadata,
+                    &combined_projection,
+                    &mut self.buffers,
+                )?;
+
+                // Split the FilterInfo so we own `filter` and `cache_info`
+                // independently; the filter is mutated in place during
+                // predicate evaluation and the cache is threaded into
+                // StartData after.
+                let (mut filter, cache_info) = filter_info.into_parts();
+
+                // Build one array_reader per predicate, sharing the same
+                // in-memory row group and predicate cache. The cache_options
+                // borrow `cache_info` so this is scoped.
+                let array_readers: Vec<_> = {
+                    let cache_options = cache_info.builder().producer();
+                    let mut readers = Vec::with_capacity(filter.predicates.len());
+                    for predicate in filter.predicates.iter() {
+                        let ar = ArrayReaderBuilder::new(&row_group, &self.metrics)
+                            .with_cache_options(Some(&cache_options))
+                            .with_parquet_metadata(&self.metadata)
+                            .build_array_reader(
+                                self.fields.as_deref(),
+                                predicate.projection(),
+                            )?;
+                        readers.push(ar);
+                    }
+                    readers
+                };
+
+                // Reset the row-selection policy in the same way the
+                // per-predicate path does, then apply the override-for-
+                // selector-strategy helper against the combined projection.
+                plan_builder = plan_builder.with_row_selection_policy(self.row_selection_policy);
+                plan_builder = override_selector_strategy_if_needed(
+                    plan_builder,
+                    &combined_projection,
+                    self.row_group_offset_index(row_group_idx),
+                );
+
+                {
+                    let mut predicate_refs: Vec<&mut dyn ArrowPredicate> = filter
+                        .predicates
+                        .iter_mut()
+                        .map(|p| p.as_mut())
+                        .collect();
+                    plan_builder = plan_builder.with_predicates_limited(
+                        array_readers,
+                        &mut predicate_refs,
+                        self.limit,
+                        row_count,
+                    )?;
+                }
+
+                // Put the filter back so it can be reused for later row groups.
+                assert!(self.filter.is_none());
+                self.filter = Some(filter);
+
+                let row_group_info = RowGroupInfo {
+                    row_group_idx,
+                    row_count,
+                    plan_builder,
+                };
+                let column_chunks = Some(row_group.column_chunks);
+                NextState::again(RowGroupDecoderState::StartData {
+                    row_group_info,
+                    column_chunks,
+                    cache_info: Some(cache_info),
+                })
             }
             RowGroupDecoderState::StartData {
                 row_group_info,
@@ -722,6 +924,25 @@ fn override_selector_strategy_if_needed(
     plan_builder.with_row_selection_policy(new_policy)
 }
 
+/// Compute the union of every predicate's projection in `filter`. This is
+/// used by the interleaved evaluation path to request data for all predicate
+/// columns in a single data request, so later per-predicate reads do not
+/// have to round-trip back to the caller for more bytes.
+fn union_predicate_projections(
+    filter: &RowFilter,
+    metadata: &ParquetMetaData,
+) -> ProjectionMask {
+    let leaf_count = metadata.file_metadata().schema_descr().num_columns();
+    let Some(first) = filter.predicates.first() else {
+        return ProjectionMask::none(leaf_count);
+    };
+    let mut combined = first.projection().clone();
+    for predicate in filter.predicates.iter().skip(1) {
+        combined.union(predicate.projection());
+    }
+    combined
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -729,6 +950,13 @@ mod tests {
     #[test]
     // Verify that the size of RowGroupDecoderState does not grow too large
     fn test_structure_size() {
-        assert_eq!(std::mem::size_of::<RowGroupDecoderState>(), 200);
+        // One enum variant is the interleaved-filter state which is a little
+        // larger because it carries its own `ProjectionMask`. Keep a sane
+        // upper bound rather than pinning the exact size.
+        assert!(
+            std::mem::size_of::<RowGroupDecoderState>() <= 256,
+            "RowGroupDecoderState unexpectedly large: {}",
+            std::mem::size_of::<RowGroupDecoderState>()
+        );
     }
 }

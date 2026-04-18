@@ -140,4 +140,12 @@ impl FilterInfo {
     pub(super) fn into_filter(self) -> RowFilter {
         self.filter
     }
+
+    /// Split this [`FilterInfo`] into its [`RowFilter`] and [`CacheInfo`]
+    /// parts. Used by the interleaved evaluation path which needs to own
+    /// both independently (the filter is iterated over and then put back on
+    /// the outer reader, the cache-info is threaded into `StartData`).
+    pub(super) fn into_parts(self) -> (RowFilter, CacheInfo) {
+        (self.filter, self.cache_info)
+    }
 }

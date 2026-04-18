@@ -25,7 +25,8 @@ use crate::arrow::arrow_reader::{
     ArrowPredicate, ParquetRecordBatchReader, RowSelection, RowSelectionCursor, RowSelector,
 };
 use crate::errors::{ParquetError, Result};
-use arrow_array::Array;
+use arrow_array::{Array, BooleanArray};
+use arrow_buffer::{BooleanBuffer, BooleanBufferBuilder};
 use arrow_select::filter::prep_null_mask_filter;
 use std::collections::VecDeque;
 
@@ -175,6 +176,180 @@ impl ReadPlanBuilder {
             return Ok(self);
         }
         let raw = RowSelection::from_filters(&filters);
+        self.selection = match self.selection.take() {
+            Some(selection) => Some(selection.and_then(&raw)),
+            None => Some(raw),
+        };
+        Ok(self)
+    }
+
+    /// Evaluate a sequence of [`ArrowPredicate`]s in lockstep, per-batch,
+    /// updating this plan's `selection` with their conjunction.
+    ///
+    /// Unlike repeated calls to [`Self::with_predicate`] — which evaluate each
+    /// predicate across the **entire** current row-group selection before
+    /// moving to the next — this method pulls a batch from every predicate's
+    /// reader, evaluates every predicate on that batch, and ANDs the results.
+    ///
+    /// The crucial difference is the behaviour when `limit` is `Some(L)`:
+    /// match counts are accumulated **across the AND-combined filters**, and
+    /// the loop stops pulling further batches as soon as `L` rows have
+    /// survived the full predicate chain. Regardless of how the caller ordered
+    /// the predicates, the most expensive predicate therefore stops
+    /// processing once the combined filter has produced enough rows to
+    /// satisfy the downstream limit.
+    ///
+    /// `array_readers` must be the same length as `predicates`, with
+    /// `array_readers[i]` projecting exactly the columns required by
+    /// `predicates[i]`. Each reader is driven from a fresh clone of the
+    /// current plan so the readers advance in lockstep over the same row
+    /// positions.
+    ///
+    /// `total_rows` is the total row count of the row group (i.e. the row
+    /// count that any existing selection on this builder covers, whether via
+    /// `select` or `skip`). When the limit short-circuits before the last
+    /// batch, we have only produced filters for the rows we actually
+    /// processed, and the remaining rows of the row group must be appended
+    /// to the result selection as skipped so `RowSelection::and_then` stays
+    /// aligned with the outer selection's total row count.
+    ///
+    /// Compared to [`Self::with_predicate`], this method decodes all
+    /// predicate columns for every batch it processes, rather than letting an
+    /// earlier predicate's selection narrow later predicates' decode. That is
+    /// only a net win when the combined-limit short-circuit keeps the number
+    /// of processed batches small — typically when there is a tight `LIMIT`
+    /// alongside an `ORDER BY` that preserves file order.
+    pub fn with_predicates_limited(
+        mut self,
+        array_readers: Vec<Box<dyn ArrayReader>>,
+        predicates: &mut [&mut dyn ArrowPredicate],
+        limit: Option<usize>,
+        total_rows: usize,
+    ) -> Result<Self> {
+        if predicates.is_empty() {
+            return Ok(self);
+        }
+        if array_readers.len() != predicates.len() {
+            return Err(general_err!(
+                "with_predicates_limited: array_readers len ({}) != predicates len ({})",
+                array_readers.len(),
+                predicates.len()
+            ));
+        }
+
+        // Each reader needs its own ReadPlan, but driven from the same
+        // current selection so the per-batch row positions line up.
+        let mut readers: Vec<ParquetRecordBatchReader> = array_readers
+            .into_iter()
+            .map(|ar| ParquetRecordBatchReader::new(ar, self.clone().build()))
+            .collect();
+
+        let mut filters: Vec<BooleanArray> = vec![];
+        let mut cumulative: usize = 0;
+        let mut processed_rows: usize = 0;
+        let mut stopped_early = false;
+
+        loop {
+            // Pull one batch from every reader.
+            let mut batches = Vec::with_capacity(readers.len());
+            let mut ended = false;
+            for r in readers.iter_mut() {
+                match r.next() {
+                    None => {
+                        ended = true;
+                        break;
+                    }
+                    Some(res) => batches.push(res?),
+                }
+            }
+            if ended {
+                // Assume all readers finish together: they share the same
+                // read plan and batch size. Any drift would surface below
+                // as a batch-length mismatch.
+                break;
+            }
+
+            let batch_len = batches[0].num_rows();
+            for b in &batches {
+                if b.num_rows() != batch_len {
+                    return Err(general_err!(
+                        "with_predicates_limited: predicate readers desynchronized (batch sizes {} vs {})",
+                        batch_len,
+                        b.num_rows()
+                    ));
+                }
+            }
+
+            // Evaluate each predicate on its own batch, AND the results.
+            let mut combined_buf: Option<BooleanBuffer> = None;
+            for (pred, batch) in predicates.iter_mut().zip(batches.into_iter()) {
+                let f = pred.evaluate(batch)?;
+                if f.len() != batch_len {
+                    return Err(general_err!(
+                        "ArrowPredicate predicate returned {} rows, expected {}",
+                        f.len(),
+                        batch_len
+                    ));
+                }
+                let f = match f.null_count() {
+                    0 => f,
+                    _ => prep_null_mask_filter(&f),
+                };
+                combined_buf = Some(match combined_buf {
+                    None => f.values().clone(),
+                    Some(prev) => &prev & f.values(),
+                });
+            }
+            let combined = BooleanArray::new(combined_buf.unwrap(), None);
+            let batch_matches = combined.true_count();
+
+            processed_rows += batch_len;
+            match limit {
+                Some(lim) if cumulative + batch_matches >= lim => {
+                    let needed = lim - cumulative;
+                    filters.push(truncate_filter_after_n_trues(&combined, needed));
+                    stopped_early = true;
+                    break;
+                }
+                _ => {
+                    cumulative += batch_matches;
+                    filters.push(combined);
+                }
+            }
+        }
+
+        // If we did not stop early, every batch was fully selected, and there
+        // is no prior selection, skip materialising a RowSelection.
+        if !stopped_early
+            && self.selection.is_none()
+            && filters.iter().all(|f| f.true_count() == f.len())
+        {
+            return Ok(self);
+        }
+
+        // `RowSelection::from_filters` produces a selection whose total row
+        // count equals the number of rows we actually processed. If we
+        // stopped early, pad with an explicit skip so the selection covers
+        // the expected total (the outer selected row count when an outer
+        // selection exists, else the full row group).
+        //
+        // `and_then`'s invariant is that `other.total == self.row_count()`
+        // (number of **selected** rows in the outer). When there is no
+        // outer selection, the resulting `raw` is used as-is, so the
+        // expected total is the row group row count. Overshooting either
+        // direction panics in `and_then`.
+        let expected_total = match self.selection.as_ref() {
+            Some(s) => s.row_count(),
+            None => total_rows,
+        };
+        let mut raw = RowSelection::from_filters(&filters);
+        if processed_rows < expected_total {
+            let skip_tail = expected_total - processed_rows;
+            let mut selectors: Vec<RowSelector> = raw.into();
+            selectors.push(RowSelector::skip(skip_tail));
+            raw = RowSelection::from(selectors);
+        }
+
         self.selection = match self.selection.take() {
             Some(selection) => Some(selection.and_then(&raw)),
             None => Some(raw),
@@ -339,6 +514,32 @@ impl ReadPlan {
     }
 }
 
+/// Return a `BooleanArray` with the same length as `filter` that keeps only
+/// the first `n` `true` positions from `filter` (in order) and replaces every
+/// other position with `false`.
+///
+/// This is used by [`ReadPlanBuilder::with_predicates_limited`] when a
+/// combined filter's `true_count()` would otherwise push the cumulative match
+/// total past a caller-supplied limit. Preserving the length matters because
+/// the filter still needs to feed [`RowSelection::from_filters`] alongside
+/// filters from earlier batches whose total rows equal the selection length.
+fn truncate_filter_after_n_trues(filter: &BooleanArray, n: usize) -> BooleanArray {
+    let len = filter.len();
+    let mut builder = BooleanBufferBuilder::new(len);
+    let mut kept = 0usize;
+    for i in 0..len {
+        // filter has no nulls at this point (callers pass `prep_null_mask_filter`-ed inputs
+        // or freshly-constructed arrays with `None` nulls), so `value` is safe.
+        if filter.value(i) && kept < n {
+            builder.append(true);
+            kept += 1;
+        } else {
+            builder.append(false);
+        }
+    }
+    BooleanArray::new(builder.finish(), None)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -366,5 +567,41 @@ mod tests {
             builder.resolve_selection_strategy(),
             RowSelectionStrategy::Selectors
         );
+    }
+
+    #[test]
+    fn truncate_filter_after_n_trues_basic() {
+        let filter = BooleanArray::from(vec![true, false, true, true, false, true]);
+        let truncated = truncate_filter_after_n_trues(&filter, 2);
+        assert_eq!(truncated.len(), filter.len());
+        // first two `true`s preserved, rest false
+        assert_eq!(
+            truncated.iter().collect::<Vec<_>>(),
+            vec![
+                Some(true),
+                Some(false),
+                Some(true),
+                Some(false),
+                Some(false),
+                Some(false)
+            ]
+        );
+    }
+
+    #[test]
+    fn truncate_filter_after_n_trues_zero_keeps_none() {
+        let filter = BooleanArray::from(vec![true, true, true]);
+        let truncated = truncate_filter_after_n_trues(&filter, 0);
+        assert_eq!(truncated.true_count(), 0);
+        assert_eq!(truncated.len(), 3);
+    }
+
+    #[test]
+    fn truncate_filter_after_n_trues_more_than_available() {
+        let filter = BooleanArray::from(vec![true, false, true]);
+        let truncated = truncate_filter_after_n_trues(&filter, 10);
+        // Only two `true`s exist, cap is higher — keep everything that was true
+        assert_eq!(truncated.true_count(), 2);
+        assert_eq!(truncated.len(), 3);
     }
 }

@@ -586,5 +586,181 @@ impl AsyncFileReader for InMemoryReader {
     }
 }
 
-criterion_group!(benches, benchmark_filters_and_projections,);
+/// Build a multi-predicate [`RowFilter`] over the shared fixture.
+///
+/// `order` controls predicate order at the SQL / caller level.
+/// Predicates used (three of them, each a small projection):
+/// * `float64 > 99.0`                   (`SelectiveUnclustered`, cheap, narrow column)
+/// * `int64  > 90`                      (`ModeratelySelectiveUnclustered`, cheap, narrow column)
+/// * `utf8View <> ''`                   (`Utf8ViewNonEmpty`, expensive, wide column)
+///
+/// In the `ExpensiveFirst` ordering the expensive predicate is evaluated
+/// first — that's the pathological shape the interleaved-evaluation +
+/// limit short-circuit was written for. `ExpensiveLast` is what a caller
+/// with `reorder_filters=true` (or a hand-reordered SQL) would produce,
+/// and serves as a control.
+fn build_multi_predicate_row_filter(
+    schema_descr: &parquet::schema::types::SchemaDescriptor,
+    order: PredicateOrder,
+) -> RowFilter {
+    let float_mask = ProjectionMask::roots(schema_descr, [1]);
+    let int_mask = ProjectionMask::roots(schema_descr, [0]);
+    let utf_mask = ProjectionMask::roots(schema_descr, [2]);
+
+    let float_pred: Box<dyn parquet::arrow::arrow_reader::ArrowPredicate> =
+        Box::new(ArrowPredicateFn::new(float_mask, |batch: RecordBatch| {
+            FilterType::SelectiveUnclustered
+                .filter_batch(&batch)
+                .map_err(|e| e.into())
+        }));
+    let int_pred: Box<dyn parquet::arrow::arrow_reader::ArrowPredicate> =
+        Box::new(ArrowPredicateFn::new(int_mask, |batch: RecordBatch| {
+            FilterType::ModeratelySelectiveUnclustered
+                .filter_batch(&batch)
+                .map_err(|e| e.into())
+        }));
+    let utf_pred: Box<dyn parquet::arrow::arrow_reader::ArrowPredicate> =
+        Box::new(ArrowPredicateFn::new(utf_mask, |batch: RecordBatch| {
+            FilterType::Utf8ViewNonEmpty
+                .filter_batch(&batch)
+                .map_err(|e| e.into())
+        }));
+
+    match order {
+        PredicateOrder::ExpensiveFirst => RowFilter::new(vec![utf_pred, float_pred, int_pred]),
+        PredicateOrder::ExpensiveLast => RowFilter::new(vec![float_pred, int_pred, utf_pred]),
+    }
+}
+
+#[derive(Clone, Copy)]
+enum PredicateOrder {
+    /// `utf8View <> '' AND float64 > 99.0 AND int64 > 90`
+    ExpensiveFirst,
+    /// `float64 > 99.0 AND int64 > 90 AND utf8View <> ''`
+    ExpensiveLast,
+}
+
+impl std::fmt::Display for PredicateOrder {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            PredicateOrder::ExpensiveFirst => write!(f, "expensive_first"),
+            PredicateOrder::ExpensiveLast => write!(f, "expensive_last"),
+        }
+    }
+}
+
+/// Benchmark `pushdown filters + LIMIT` — the shape that exercises the
+/// interleaved evaluation path.
+///
+/// For each predicate order and each limit, runs the reader end-to-end via
+/// both the sync and async APIs with `with_row_filter` + `with_limit`.
+///
+/// Before the interleaved-evaluation patch, `expensive_first` was ~6–10×
+/// slower than `expensive_last`. Afterwards, the two orders should
+/// converge: the combined filter's limit short-circuit means it no longer
+/// matters which predicate the caller put first.
+fn benchmark_filters_with_limit(c: &mut Criterion) {
+    let parquet_file = Bytes::from(write_parquet_file());
+    let reader = InMemoryReader::try_new(&parquet_file).unwrap();
+    let metadata = Arc::clone(reader.metadata());
+    let schema_descr = metadata.file_metadata().schema_descr();
+    // Project all four columns in the output.
+    let projection_mask = ProjectionMask::roots(schema_descr, [0, 1, 2, 3]);
+
+    let rt = tokio::runtime::Builder::new_multi_thread()
+        .enable_all()
+        .build()
+        .unwrap();
+
+    let mut group = c.benchmark_group("arrow_reader_row_filter_with_limit");
+
+    for order in [
+        PredicateOrder::ExpensiveFirst,
+        PredicateOrder::ExpensiveLast,
+    ] {
+        for limit in [10usize, 1000] {
+            let bench_name = format!("{order}/limit={limit}");
+
+            // async
+            let bench_id = BenchmarkId::new(bench_name.clone(), "async");
+            let rt_captured = rt.handle().clone();
+            group.bench_function(bench_id, |b| {
+                b.iter(|| {
+                    let reader = reader.clone();
+                    let projection_mask = projection_mask.clone();
+                    let schema_descr = schema_descr.clone();
+                    let row_filter = build_multi_predicate_row_filter(&schema_descr, order);
+                    rt_captured.block_on(async {
+                        benchmark_async_reader_limited(
+                            reader,
+                            projection_mask,
+                            row_filter,
+                            limit,
+                        )
+                        .await;
+                    })
+                });
+            });
+
+            // sync
+            let bench_id = BenchmarkId::new(bench_name, "sync");
+            group.bench_function(bench_id, |b| {
+                b.iter(|| {
+                    let reader = reader.clone();
+                    let projection_mask = projection_mask.clone();
+                    let schema_descr = schema_descr.clone();
+                    let row_filter = build_multi_predicate_row_filter(&schema_descr, order);
+                    benchmark_sync_reader_limited(reader, projection_mask, row_filter, limit);
+                });
+            });
+        }
+    }
+}
+
+/// Same as [`benchmark_async_reader`] but passes `with_limit` through.
+async fn benchmark_async_reader_limited(
+    reader: InMemoryReader,
+    projection_mask: ProjectionMask,
+    row_filter: RowFilter,
+    limit: usize,
+) {
+    let mut stream = ParquetRecordBatchStreamBuilder::new(reader)
+        .await
+        .unwrap()
+        .with_batch_size(8192)
+        .with_projection(projection_mask)
+        .with_row_filter(row_filter)
+        .with_limit(limit)
+        .build()
+        .unwrap();
+    while let Some(b) = stream.next().await {
+        b.unwrap();
+    }
+}
+
+/// Same as [`benchmark_sync_reader`] but passes `with_limit` through.
+fn benchmark_sync_reader_limited(
+    reader: InMemoryReader,
+    projection_mask: ProjectionMask,
+    row_filter: RowFilter,
+    limit: usize,
+) {
+    let stream = ParquetRecordBatchReaderBuilder::try_new(reader.into_inner())
+        .unwrap()
+        .with_batch_size(8192)
+        .with_projection(projection_mask)
+        .with_row_filter(row_filter)
+        .with_limit(limit)
+        .build()
+        .unwrap();
+    for b in stream {
+        b.unwrap();
+    }
+}
+
+criterion_group!(
+    benches,
+    benchmark_filters_and_projections,
+    benchmark_filters_with_limit,
+);
 criterion_main!(benches);

@@ -1205,19 +1205,48 @@ impl<T: ChunkReader + 'static> ParquetRecordBatchReaderBuilder<T> {
             .with_selection(selection)
             .with_row_selection_policy(row_selection_policy);
 
-        // Update selection based on any filters
+        // Update selection based on any filters.
+        //
+        // When `limit` is set and there is more than one predicate, drive all
+        // predicates in lockstep so the combined-filter's limit short-circuit
+        // can halt work regardless of which predicate is the expensive one.
+        // For a single predicate this is equivalent to the legacy path; for
+        // zero predicates both arms are no-ops.
         if let Some(filter) = filter.as_mut() {
-            for predicate in filter.predicates.iter_mut() {
-                // break early if we have ruled out all rows
-                if !plan_builder.selects_any() {
-                    break;
+            let use_interleaved = limit.is_some() && !filter.predicates.is_empty();
+            if use_interleaved && plan_builder.selects_any() {
+                let mut array_readers = Vec::with_capacity(filter.predicates.len());
+                for predicate in filter.predicates.iter() {
+                    let ar = ArrayReaderBuilder::new(&reader, &metrics)
+                        .with_parquet_metadata(&reader.metadata)
+                        .build_array_reader(fields.as_deref(), predicate.projection())?;
+                    array_readers.push(ar);
                 }
+                let mut predicate_refs: Vec<&mut dyn ArrowPredicate> = filter
+                    .predicates
+                    .iter_mut()
+                    .map(|p| p.as_mut())
+                    .collect();
+                plan_builder = plan_builder.with_predicates_limited(
+                    array_readers,
+                    &mut predicate_refs,
+                    limit,
+                    reader.num_rows(),
+                )?;
+            } else {
+                for predicate in filter.predicates.iter_mut() {
+                    // break early if we have ruled out all rows
+                    if !plan_builder.selects_any() {
+                        break;
+                    }
 
-                let array_reader = ArrayReaderBuilder::new(&reader, &metrics)
-                    .with_parquet_metadata(&reader.metadata)
-                    .build_array_reader(fields.as_deref(), predicate.projection())?;
+                    let array_reader = ArrayReaderBuilder::new(&reader, &metrics)
+                        .with_parquet_metadata(&reader.metadata)
+                        .build_array_reader(fields.as_deref(), predicate.projection())?;
 
-                plan_builder = plan_builder.with_predicate(array_reader, predicate.as_mut())?;
+                    plan_builder =
+                        plan_builder.with_predicate(array_reader, predicate.as_mut())?;
+                }
             }
         }
 
