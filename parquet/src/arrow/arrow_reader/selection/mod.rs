@@ -45,7 +45,8 @@ mod selector;
 
 use algebra::{
     and_then_mask, and_then_row_selections, and_then_selectors_with_mask, intersect_masks,
-    intersect_row_selections, union_masks, union_row_selections,
+    intersect_row_selections, intersect_selectors_with_mask, union_masks, union_row_selections,
+    union_selectors_with_mask,
 };
 pub use boolean::MaskRunIter;
 pub(crate) use boolean::mask_to_selectors;
@@ -480,6 +481,12 @@ impl RowSelection {
     /// other:     NYNNNNNNY
     ///
     /// returned:  NNNNNNNNYYNYN
+    ///
+    /// If one selection is selector-backed and the other mask-backed, the
+    /// cheaper implementation is chosen based on how fragmented the mask is:
+    /// either the selector runs of both sides are merged, streaming the mask
+    /// without materializing it as selectors, or the selectors are converted
+    /// to a bitmap and combined bitwise, keeping the result mask-backed.
     pub fn intersection(&self, other: &Self) -> Self {
         match (&self.inner, &other.inner) {
             (RowSelectionInner::Mask(l), RowSelectionInner::Mask(r)) => {
@@ -489,12 +496,10 @@ impl RowSelection {
                 intersect_row_selections(l, r)
             }
             (RowSelectionInner::Selectors(l), RowSelectionInner::Mask(r)) => {
-                let r = mask_to_selectors(r.mask());
-                intersect_row_selections(l, &r)
+                intersect_selectors_with_mask(l, r.mask())
             }
             (RowSelectionInner::Mask(l), RowSelectionInner::Selectors(r)) => {
-                let l = mask_to_selectors(l.mask());
-                intersect_row_selections(&l, r)
+                intersect_selectors_with_mask(r, l.mask())
             }
         }
     }
@@ -505,24 +510,23 @@ impl RowSelection {
     /// other:     NYNNNNNNN
     ///
     /// returned:  NYYYYYNNYYNYN
+    ///
+    /// Mixed selector/mask operands are handled as described on
+    /// [`Self::intersection`].
     pub fn union(&self, other: &Self) -> Self {
-        match &self.inner {
-            RowSelectionInner::Mask(l) => match &other.inner {
-                RowSelectionInner::Mask(r) => {
-                    Self::from_boolean_buffer(union_masks(l.mask(), r.mask()))
-                }
-                RowSelectionInner::Selectors(r) => {
-                    let l = mask_to_selectors(l.mask());
-                    union_row_selections(&l, r)
-                }
-            },
-            RowSelectionInner::Selectors(l) => match &other.inner {
-                RowSelectionInner::Mask(r) => {
-                    let r = mask_to_selectors(r.mask());
-                    union_row_selections(l, &r)
-                }
-                RowSelectionInner::Selectors(r) => union_row_selections(l, r),
-            },
+        match (&self.inner, &other.inner) {
+            (RowSelectionInner::Mask(l), RowSelectionInner::Mask(r)) => {
+                Self::from_boolean_buffer(union_masks(l.mask(), r.mask()))
+            }
+            (RowSelectionInner::Selectors(l), RowSelectionInner::Selectors(r)) => {
+                union_row_selections(l, r)
+            }
+            (RowSelectionInner::Selectors(l), RowSelectionInner::Mask(r)) => {
+                union_selectors_with_mask(l, r.mask())
+            }
+            (RowSelectionInner::Mask(l), RowSelectionInner::Selectors(r)) => {
+                union_selectors_with_mask(r, l.mask())
+            }
         }
     }
 

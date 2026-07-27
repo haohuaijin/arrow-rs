@@ -39,6 +39,12 @@ const COLUMN_WIDTHS: &[usize] = &[2, 4, 8, 16, 32];
 const UTF8VIEW_LENS: &[usize] = &[4, 8, 16, 32, 64, 128, 256];
 const BENCH_MODES: &[BenchMode] = &[BenchMode::Selector, BenchMode::Mask, BenchMode::Auto];
 const BACKINGS: &[Backing] = &[Backing::Selectors, Backing::Mask];
+/// Row count for the mixed-backing `intersection` / `union` benchmarks
+const ALGEBRA_TOTAL_ROWS: usize = 1 << 21;
+/// Run lengths of the mask-backed operand, from alternating to coarse
+const ALGEBRA_MASK_RUN_LENS: &[usize] = &[1, 4, 16, 64, 256, 1024];
+/// Run length of the selector-backed operand, sized like page level pruning
+const ALGEBRA_SELECTOR_RUN_LEN: usize = 8192;
 
 struct DataProfile {
     name: &'static str,
@@ -205,6 +211,75 @@ fn criterion_benchmark(c: &mut Criterion) {
             BASE_SEED ^ ((offset as u64) << 40),
         );
     }
+
+    bench_mixed_backing_algebra(c);
+}
+
+/// Benchmarks `intersection` / `union` of a mask-backed selection with a
+/// coarse selector-backed one, e.g. an externally provided bitmap combined
+/// with a selection derived from page level pruning.
+///
+/// The mask's run length is swept from fragmented (where run length encoding
+/// the mask is much more expensive than operating on the bitmap directly) to
+/// coarse (where merging the runs of both sides is cheaper).
+fn bench_mixed_backing_algebra(c: &mut Criterion) {
+    let selectors = coarse_selector_selection(ALGEBRA_TOTAL_ROWS, ALGEBRA_SELECTOR_RUN_LEN);
+
+    for &run_len in ALGEBRA_MASK_RUN_LENS {
+        let input = (
+            alternating_mask_selection(ALGEBRA_TOTAL_ROWS, run_len),
+            selectors.clone(),
+        );
+        let suffix = format!(
+            "rows{}-maskrun{:05}-selrun{:05}",
+            ALGEBRA_TOTAL_ROWS, run_len, ALGEBRA_SELECTOR_RUN_LEN
+        );
+
+        c.bench_with_input(
+            BenchmarkId::new("intersection_mask_selectors", &suffix),
+            &input,
+            |b, (mask, selectors)| {
+                b.iter(|| hint::black_box(mask.intersection(selectors)));
+            },
+        );
+
+        c.bench_with_input(
+            BenchmarkId::new("union_mask_selectors", &suffix),
+            &input,
+            |b, (mask, selectors)| {
+                b.iter(|| hint::black_box(mask.union(selectors)));
+            },
+        );
+    }
+}
+
+/// A mask-backed selection alternating select/skip runs of `run_len` rows.
+fn alternating_mask_selection(total_rows: usize, run_len: usize) -> RowSelection {
+    let mut builder = BooleanBufferBuilder::new(total_rows);
+    let mut select = true;
+    while builder.len() < total_rows {
+        builder.append_n(run_len.min(total_rows - builder.len()), select);
+        select = !select;
+    }
+    RowSelection::from_boolean_buffer(builder.finish())
+}
+
+/// A selector-backed selection alternating select/skip runs of `run_len` rows.
+fn coarse_selector_selection(total_rows: usize, run_len: usize) -> RowSelection {
+    let mut selectors = Vec::with_capacity(total_rows.div_ceil(run_len));
+    let mut remaining = total_rows;
+    let mut select = false;
+    while remaining > 0 {
+        let len = run_len.min(remaining);
+        selectors.push(if select {
+            RowSelector::select(len)
+        } else {
+            RowSelector::skip(len)
+        });
+        remaining -= len;
+        select = !select;
+    }
+    RowSelection::from(selectors)
 }
 
 fn bench_over_lengths(

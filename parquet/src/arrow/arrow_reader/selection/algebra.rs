@@ -22,6 +22,7 @@
 //! operands: a merge of the [`RowSelector`] runs, and a bitwise variant over
 //! [`BooleanBuffer`] masks.
 
+use super::boolean::{boolean_mask_from_selectors, mask_has_at_least_runs};
 use super::{MaskRunIter, RowSelection, RowSelectionInner, RowSelector};
 use arrow_buffer::{BooleanBuffer, BooleanBufferBuilder};
 use std::cmp::Ordering;
@@ -127,10 +128,19 @@ pub(super) fn intersect_row_selections(
     left: &[RowSelector],
     right: &[RowSelector],
 ) -> RowSelection {
-    let mut l_iter = left.iter().copied().peekable();
-    let mut r_iter = right.iter().copied().peekable();
+    intersect_iter(left.iter().copied(), right.iter().copied()).collect()
+}
 
-    let iter = std::iter::from_fn(move || {
+/// [`intersect_row_selections`] over arbitrary [`RowSelector`] streams.
+fn intersect_iter<I, J>(left: I, right: J) -> impl Iterator<Item = RowSelector>
+where
+    I: Iterator<Item = RowSelector>,
+    J: Iterator<Item = RowSelector>,
+{
+    let mut l_iter = left.peekable();
+    let mut r_iter = right.peekable();
+
+    std::iter::from_fn(move || {
         loop {
             let l = l_iter.peek_mut();
             let r = r_iter.peek_mut();
@@ -175,9 +185,7 @@ pub(super) fn intersect_row_selections(
                 (None, None) => return None,
             }
         }
-    });
-
-    iter.collect()
+    })
 }
 
 /// Combine two lists of `RowSelector` return the union of them
@@ -189,10 +197,19 @@ pub(super) fn intersect_row_selections(
 ///
 /// This can be removed from here once RowSelection::union is in parquet::arrow
 pub(super) fn union_row_selections(left: &[RowSelector], right: &[RowSelector]) -> RowSelection {
-    let mut l_iter = left.iter().copied().peekable();
-    let mut r_iter = right.iter().copied().peekable();
+    union_iter(left.iter().copied(), right.iter().copied()).collect()
+}
 
-    let iter = std::iter::from_fn(move || {
+/// [`union_row_selections`] over arbitrary [`RowSelector`] streams.
+fn union_iter<I, J>(left: I, right: J) -> impl Iterator<Item = RowSelector>
+where
+    I: Iterator<Item = RowSelector>,
+    J: Iterator<Item = RowSelector>,
+{
+    let mut l_iter = left.peekable();
+    let mut r_iter = right.peekable();
+
+    std::iter::from_fn(move || {
         loop {
             let l = l_iter.peek_mut();
             let r = r_iter.peek_mut();
@@ -261,9 +278,7 @@ pub(super) fn union_row_selections(left: &[RowSelector], right: &[RowSelector]) 
                 (None, None) => return None,
             }
         }
-    });
-
-    iter.collect()
+    })
 }
 
 /// Bitwise AND of two mask-backed selections. Longer side's tail passes through.
@@ -302,6 +317,116 @@ pub(super) fn union_masks(l: &BooleanBuffer, r: &BooleanBuffer) -> BooleanBuffer
     builder.append_buffer(&head);
     builder.append_buffer(&tail);
     builder.finish()
+}
+
+/// Computes the intersection of a selector-backed and a mask-backed selection.
+///
+/// Intersection is commutative, so this handles both operand orders.
+///
+/// See [`mask_prefix_is_fragmented`] for how the implementation is chosen.
+pub(super) fn intersect_selectors_with_mask(
+    selectors: &[RowSelector],
+    mask: &BooleanBuffer,
+) -> RowSelection {
+    if !mask_prefix_is_fragmented(mask) {
+        let limit = merged_selector_limit(selectors, mask);
+        let merged = intersect_iter(selectors.iter().copied(), MaskRunIter::new(mask));
+        if let Some(selectors) = collect_selectors_within_limit(merged, limit) {
+            return RowSelection::from_selectors(selectors);
+        }
+    }
+
+    let selector_mask = boolean_mask_from_selectors(selectors);
+    RowSelection::from_boolean_buffer(intersect_masks(&selector_mask, mask))
+}
+
+/// Computes the union of a selector-backed and a mask-backed selection.
+///
+/// Union is commutative, so this handles both operand orders.
+///
+/// See [`mask_prefix_is_fragmented`] for how the implementation is chosen.
+pub(super) fn union_selectors_with_mask(
+    selectors: &[RowSelector],
+    mask: &BooleanBuffer,
+) -> RowSelection {
+    if !mask_prefix_is_fragmented(mask) {
+        let limit = merged_selector_limit(selectors, mask);
+        let merged = union_iter(selectors.iter().copied(), MaskRunIter::new(mask));
+        if let Some(selectors) = collect_selectors_within_limit(merged, limit) {
+            return RowSelection::from_selectors(selectors);
+        }
+    }
+
+    let selector_mask = boolean_mask_from_selectors(selectors);
+    RowSelection::from_boolean_buffer(union_masks(&selector_mask, mask))
+}
+
+/// Number of rows whose mask bits occupy the same space as a single
+/// [`RowSelector`] (16 bytes, i.e. 128 bits).
+const ROWS_PER_SELECTOR: usize = 8 * std::mem::size_of::<RowSelector>();
+
+/// Number of leading mask rows inspected by [`mask_prefix_is_fragmented`].
+const PROBE_ROWS: usize = 1 << 16;
+
+/// Returns `true` if the first [`PROBE_ROWS`] rows of `mask` contain more runs
+/// than the same rows would need as [`RowSelector`]s.
+///
+/// This picks between the two implementations of the mixed-backing operations:
+///
+/// * merge the runs of both sides, streaming the mask through [`MaskRunIter`],
+///   producing a selector-backed result
+/// * convert the selectors to a bitmap and combine both sides bitwise,
+///   producing a mask-backed result
+///
+/// The cost and output size of the merge are proportional to the number of
+/// runs, and run-length encoding a fragmented mask expands it by up to ~128x
+/// (one 16 byte `RowSelector` per row instead of one bit), so such masks
+/// should take the bitwise implementation. Counting every run to detect this
+/// would scan the entire bitmap and cost as much as the bitwise implementation
+/// itself, so only a bounded prefix is inspected. Masks that only become
+/// fragmented after the prefix are handled by [`merged_selector_limit`].
+fn mask_prefix_is_fragmented(mask: &BooleanBuffer) -> bool {
+    let probe_rows = mask.len().min(PROBE_ROWS);
+    let probe = mask.slice(0, probe_rows);
+    // Stops scanning as soon as the boundary is crossed
+    mask_has_at_least_runs(&probe, probe_rows / ROWS_PER_SELECTOR + 1)
+}
+
+/// Maximum number of [`RowSelector`]s a mixed-backing merge may produce before
+/// its output outgrows the bitmaps the bitwise implementation would allocate.
+fn merged_selector_limit(selectors: &[RowSelector], mask: &BooleanBuffer) -> usize {
+    // The longer operand determines the bitmap size; the shorter operand's
+    // tail is passed through unchanged by both implementations.
+    let selector_rows: usize = selectors.iter().map(|s| s.row_count).sum();
+    selector_rows.max(mask.len()) / ROWS_PER_SELECTOR + 1
+}
+
+/// Collects merged runs into a normalized selector list (no empty selectors,
+/// adjacent selectors combined), returning `None` once more than `limit`
+/// selectors would be produced.
+///
+/// This bounds the cost of a merge that [`mask_prefix_is_fragmented`] chose
+/// based on the mask's prefix alone.
+fn collect_selectors_within_limit<I>(iter: I, limit: usize) -> Option<Vec<RowSelector>>
+where
+    I: Iterator<Item = RowSelector>,
+{
+    let mut selectors: Vec<RowSelector> = Vec::new();
+    for selector in iter.filter(|s| s.row_count != 0) {
+        match selectors.last_mut() {
+            // Combine consecutive selectors
+            Some(last) if last.skip == selector.skip => {
+                last.row_count = last.row_count.checked_add(selector.row_count).unwrap();
+            }
+            _ => {
+                if selectors.len() >= limit {
+                    return None;
+                }
+                selectors.push(selector);
+            }
+        }
+    }
+    Some(selectors)
 }
 
 /// Applies `other` to the selected rows of `mask`, preserving the original row domain.
@@ -824,5 +949,212 @@ mod tests {
         let r_mask = r.as_mask().unwrap();
         let bits: Vec<bool> = (0..5).map(|i| r_mask.value(i)).collect();
         assert_eq!(bits, vec![true, true, false, false, true]);
+    }
+
+    /// Bits alternating every row, whose run length encoding is far larger
+    /// than the bitmap
+    fn fragmented_bits(len: usize) -> Vec<bool> {
+        (0..len).map(|i| i % 2 == 0).collect()
+    }
+
+    /// Bits with runs long enough that the run length encoding is smaller
+    /// than the bitmap
+    fn coarse_bits(len: usize) -> Vec<bool> {
+        (0..len).map(|i| (i / 4096) % 2 == 0).collect()
+    }
+
+    #[test]
+    fn test_fragmented_mask_mixed_ops_stay_mask_backed() {
+        let rows = 1 << 16;
+        let mask_bits = fragmented_bits(rows);
+        let selector_bits: Vec<bool> = coarse_bits(rows);
+
+        let mask = RowSelection::from_boolean_buffer(BooleanBuffer::from(mask_bits.clone()));
+        let selectors = RowSelection::from_filters(&[BooleanArray::from(selector_bits.clone())]);
+        // Sanity check that the selector side is coarse
+        assert!(selectors.iter().count() < 64);
+
+        let expected_intersection = RowSelection::from_filters(&[BooleanArray::from(zip_bits(
+            &mask_bits,
+            &selector_bits,
+            |a, b| a && b,
+        ))]);
+        let expected_union = RowSelection::from_filters(&[BooleanArray::from(zip_bits(
+            &mask_bits,
+            &selector_bits,
+            |a, b| a || b,
+        ))]);
+
+        for (l, r) in [(&mask, &selectors), (&selectors, &mask)] {
+            let intersection = l.intersection(r);
+            assert!(
+                intersection.as_mask().is_some(),
+                "fragmented mask should stay mask-backed"
+            );
+            assert_eq!(intersection, expected_intersection);
+
+            let union = l.union(r);
+            assert!(
+                union.as_mask().is_some(),
+                "fragmented mask should stay mask-backed"
+            );
+            assert_eq!(union, expected_union);
+        }
+    }
+
+    #[test]
+    fn test_coarse_mask_mixed_ops_merge_runs() {
+        let rows = 1 << 16;
+        let mask_bits = coarse_bits(rows);
+        let selector_bits: Vec<bool> = (0..rows).map(|i| (i / 3000) % 2 == 1).collect();
+
+        let mask = RowSelection::from_boolean_buffer(BooleanBuffer::from(mask_bits.clone()));
+        let selectors = RowSelection::from_filters(&[BooleanArray::from(selector_bits.clone())]);
+
+        let expected_intersection = RowSelection::from_filters(&[BooleanArray::from(zip_bits(
+            &mask_bits,
+            &selector_bits,
+            |a, b| a && b,
+        ))]);
+        let expected_union = RowSelection::from_filters(&[BooleanArray::from(zip_bits(
+            &mask_bits,
+            &selector_bits,
+            |a, b| a || b,
+        ))]);
+
+        for (l, r) in [(&mask, &selectors), (&selectors, &mask)] {
+            let intersection = l.intersection(r);
+            assert!(
+                intersection.as_mask().is_none(),
+                "coarse mask should merge into the selector form"
+            );
+            assert_eq!(intersection, expected_intersection);
+
+            let union = l.union(r);
+            assert!(
+                union.as_mask().is_none(),
+                "coarse mask should merge into the selector form"
+            );
+            assert_eq!(union, expected_union);
+        }
+    }
+
+    #[test]
+    fn test_mask_fragmenting_past_the_probe_falls_back_to_bitwise() {
+        // Coarse for the entire probed prefix, alternating afterwards: the
+        // merge is chosen, then abandoned once it exceeds the selector limit
+        let head_rows = PROBE_ROWS;
+        let tail_rows = PROBE_ROWS;
+        let mask_bits: Vec<bool> = coarse_bits(head_rows)
+            .into_iter()
+            .chain(fragmented_bits(tail_rows))
+            .collect();
+        let selector_bits = coarse_bits(head_rows + tail_rows);
+
+        let mask = RowSelection::from_boolean_buffer(BooleanBuffer::from(mask_bits.clone()));
+        let selectors = RowSelection::from_filters(&[BooleanArray::from(selector_bits.clone())]);
+
+        let intersection = mask.intersection(&selectors);
+        assert!(
+            intersection.as_mask().is_some(),
+            "mask fragmented after the probed prefix should still use the bitwise implementation"
+        );
+        assert_eq!(
+            intersection,
+            RowSelection::from_filters(&[BooleanArray::from(zip_bits(
+                &mask_bits,
+                &selector_bits,
+                |a, b| a && b
+            ))])
+        );
+
+        let union = mask.union(&selectors);
+        assert!(union.as_mask().is_some());
+        assert_eq!(
+            union,
+            RowSelection::from_filters(&[BooleanArray::from(zip_bits(
+                &mask_bits,
+                &selector_bits,
+                |a, b| a || b
+            ))])
+        );
+    }
+
+    /// Combines two bit vectors of possibly different lengths, passing the
+    /// longer side's tail through as both implementations do.
+    fn zip_bits(left: &[bool], right: &[bool], op: fn(bool, bool) -> bool) -> Vec<bool> {
+        let common = left.len().min(right.len());
+        let longer = if left.len() > right.len() {
+            left
+        } else {
+            right
+        };
+        (0..longer.len())
+            .map(|i| {
+                if i < common {
+                    op(left[i], right[i])
+                } else {
+                    longer[i]
+                }
+            })
+            .collect()
+    }
+
+    #[test]
+    fn test_mixed_backing_ops_fuzz_equivalence() {
+        let mut rand = rng();
+        for _ in 0..200 {
+            // Random run lengths cover both the merge and the bitwise
+            // implementation
+            let mask_len = rand.random_range(0..2000);
+            let run_len = rand.random_range(1..64);
+            let mask_bits: Vec<bool> = {
+                let mut bits = Vec::with_capacity(mask_len);
+                let mut value = rand.random_bool(0.5);
+                while bits.len() < mask_len {
+                    let len = rand.random_range(1..=run_len).min(mask_len - bits.len());
+                    bits.extend(std::iter::repeat_n(value, len));
+                    value = !value;
+                }
+                bits
+            };
+            // Sized independently of the mask to exercise the uneven-length
+            // tail handling
+            let selector_len = rand.random_range(0..2000);
+            let selector_bits: Vec<bool> =
+                (0..selector_len).map(|_| rand.random_bool(0.4)).collect();
+
+            let mask = RowSelection::from_boolean_buffer(BooleanBuffer::from(mask_bits.clone()));
+            let selectors =
+                RowSelection::from_filters(&[BooleanArray::from(selector_bits.clone())]);
+            // The same rows selector-backed, so the mixed results can be
+            // compared against the selector-only implementation
+            let mask_as_selectors =
+                RowSelection::from_filters(&[BooleanArray::from(mask_bits.clone())]);
+
+            let expected_intersection = mask_as_selectors.intersection(&selectors);
+            assert_eq!(mask.intersection(&selectors), expected_intersection);
+            assert_eq!(selectors.intersection(&mask), expected_intersection);
+            assert_eq!(
+                expected_intersection,
+                RowSelection::from_filters(&[BooleanArray::from(zip_bits(
+                    &mask_bits,
+                    &selector_bits,
+                    |a, b| a && b
+                ))])
+            );
+
+            let expected_union = mask_as_selectors.union(&selectors);
+            assert_eq!(mask.union(&selectors), expected_union);
+            assert_eq!(selectors.union(&mask), expected_union);
+            assert_eq!(
+                expected_union,
+                RowSelection::from_filters(&[BooleanArray::from(zip_bits(
+                    &mask_bits,
+                    &selector_bits,
+                    |a, b| a || b
+                ))])
+            );
+        }
     }
 }
