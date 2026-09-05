@@ -23,6 +23,7 @@
 //! [`BooleanBuffer`] masks.
 
 use super::{MaskRunIter, RowSelection, RowSelectionInner, RowSelector};
+use arrow_buffer::bit_chunk_iterator::BitChunks;
 use arrow_buffer::{BooleanBuffer, BooleanBufferBuilder, MutableBuffer, bit_util};
 use std::cmp::Ordering;
 use std::iter::Peekable;
@@ -424,10 +425,15 @@ fn and_then_masks(mask: &BooleanBuffer, other: &BooleanBuffer) -> BooleanBuffer 
         return mask.clone();
     }
 
-    if should_use_dense_mask(mask.len(), selected_count, other_true_count) {
+    if should_use_dense_mask(mask.len(), selected_count, other_true_count, other) {
         return and_then_dense_masks(mask, other);
     }
 
+    and_then_sparse_masks(mask, other)
+}
+
+#[inline(never)]
+fn and_then_sparse_masks(mask: &BooleanBuffer, other: &BooleanBuffer) -> BooleanBuffer {
     let mut builder = BooleanBufferBuilder::new(mask.len());
     let mut outer_set_indices = mask.set_indices();
     let mut next_selected_ordinal = 0usize;
@@ -458,10 +464,21 @@ fn and_then_masks(mask: &BooleanBuffer, other: &BooleanBuffer) -> BooleanBuffer 
 /// `other_true_count` of those rows survive the inner selection. See the
 /// `AND_THEN_DENSE_MASK_*` constants for the rationale behind each threshold.
 #[inline]
-fn should_use_dense_mask(mask_len: usize, selected_count: usize, other_true_count: usize) -> bool {
+fn should_use_dense_mask(
+    mask_len: usize,
+    selected_count: usize,
+    other_true_count: usize,
+    other: &BooleanBuffer,
+) -> bool {
     mask_len >= AND_THEN_DENSE_MASK_MIN_LEN
         && mask_len - selected_count <= mask_len.div_ceil(AND_THEN_DENSE_MASK_MAX_DROPPED_FRACTION)
         && other_true_count >= selected_count / AND_THEN_DENSE_MASK_MIN_INNER_FRACTION
+        // A low-selectivity inner mask may let the set-index path stop early.
+        // Require a survivor near the end, or enough survivors to amortize
+        // expanding the entire outer mask.
+        && (other_true_count >= selected_count / 4
+            || BitChunks::new(other.values(), other.offset() + other.len() - 64, 64)
+                .iter().next().unwrap() != 0)
 }
 
 /// Expands `other` into the set positions of a dense `mask`, processing one
@@ -855,7 +872,8 @@ mod tests {
                 assert!(should_use_dense_mask(
                     outer.len(),
                     inner.len(),
-                    inner.count_set_bits()
+                    inner.count_set_bits(),
+                    &inner,
                 ));
 
                 let mut inner_idx = 0;
@@ -893,7 +911,8 @@ mod tests {
             assert!(should_use_dense_mask(
                 outer.len(),
                 inner.len(),
-                inner.count_set_bits()
+                inner.count_set_bits(),
+                &inner,
             ));
 
             let mut inner_idx = 0;
@@ -918,11 +937,47 @@ mod tests {
         let len = 8192;
         let selected = len * 3 / 4;
         let min_inner = selected / AND_THEN_DENSE_MASK_MIN_INNER_FRACTION;
+        let inner = BooleanBuffer::from_iter((0..selected).map(|i| i >= selected - min_inner));
 
-        assert!(!should_use_dense_mask(len - 1, selected, min_inner));
-        assert!(!should_use_dense_mask(len, selected - 1, min_inner));
-        assert!(!should_use_dense_mask(len, selected, min_inner - 1));
-        assert!(should_use_dense_mask(len, selected, min_inner));
+        assert!(!should_use_dense_mask(len - 1, selected, min_inner, &inner));
+        assert!(!should_use_dense_mask(len, selected - 1, min_inner, &inner));
+        assert!(!should_use_dense_mask(len, selected, min_inner - 1, &inner));
+        assert!(should_use_dense_mask(len, selected, min_inner, &inner));
+    }
+
+    #[test]
+    fn test_dense_mask_tail_policy() {
+        let len = 8192;
+        let selected = len * 3 / 4;
+        for offset in [0, 1, 7, 63, 65] {
+            for count in [selected / 20, selected / 4 - 1, selected / 4] {
+                for last in [
+                    None,
+                    Some(selected - 65),
+                    Some(selected - 64),
+                    Some(selected - 1),
+                ] {
+                    let mut bits = vec![true; offset + selected + 64];
+                    bits[offset..offset + selected].fill(false);
+                    bits[offset..offset + count].fill(true);
+                    if let Some(last) = last {
+                        bits[offset + count - 1] = false;
+                        bits[offset + last] = true;
+                    }
+                    let inner = BooleanBuffer::from(bits).slice(offset, selected);
+                    assert_eq!(inner.count_set_bits(), count);
+                    assert_eq!(
+                        should_use_dense_mask(len, selected, count, &inner),
+                        count >= selected / 4 || last.is_some_and(|i| i >= selected - 64)
+                    );
+                    let outer = BooleanBuffer::from_iter((0..len).map(|i| i % 4 != 0));
+                    let mut values = inner.iter();
+                    let expected =
+                        BooleanBuffer::from_iter(outer.iter().map(|v| v && values.next().unwrap()));
+                    assert_eq!(and_then_masks(&outer, &inner), expected);
+                }
+            }
+        }
     }
 
     #[test]
