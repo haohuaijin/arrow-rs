@@ -343,3 +343,8 @@ bench = false
 
 [lints]
 workspace = true
+
+[[bench]]
+name = "push_decoder_page_ranges"
+required-features = ["arrow"]
+harness = false

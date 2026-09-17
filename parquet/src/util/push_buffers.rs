@@ -18,6 +18,8 @@
 use crate::errors::ParquetError;
 use crate::file::reader::{ChunkReader, Length};
 use bytes::Bytes;
+#[cfg(feature = "arrow")]
+use std::collections::HashSet;
 use std::fmt::Display;
 use std::ops::Range;
 
@@ -51,6 +53,9 @@ pub struct PushBuffers {
     ranges: Vec<Range<u64>>,
     /// The buffers of data that can be used to decode the Parquet file
     buffers: Vec<Bytes>,
+    /// Out-of-order or overlapping ranges require insertion-order lookup.
+    /// The usual ordered, disjoint page ranges can use binary search.
+    unordered: bool,
 }
 
 impl Display for PushBuffers {
@@ -89,6 +94,7 @@ impl PushBuffers {
             file_len,
             ranges: Vec::new(),
             buffers: Vec::new(),
+            unordered: false,
         }
     }
 
@@ -132,6 +138,11 @@ impl PushBuffers {
                 range.end
             ));
         }
+        self.unordered |= range.start > range.end
+            || self
+                .ranges
+                .last()
+                .is_some_and(|last| last.end > range.start);
         self.ranges.push(range);
         self.buffers.push(buffer);
         Ok(())
@@ -139,9 +150,24 @@ impl PushBuffers {
 
     /// Returns true if the Buffers contains data for the given range
     pub(crate) fn has_range(&self, range: &Range<u64>) -> bool {
+        self.find_range(range).is_some()
+    }
+
+    /// Find the first inserted buffer containing the entire requested range.
+    fn find_range(&self, range: &Range<u64>) -> Option<usize> {
+        if self.unordered {
+            return self
+                .ranges
+                .iter()
+                .position(|r| r.start <= range.start && r.end >= range.end);
+        }
+        // Searching by end preserves first-buffer precedence for empty reads
+        // at the boundary between adjacent buffers, including empty buffers.
+        let idx = self.ranges.partition_point(|r| r.end < range.end);
         self.ranges
-            .iter()
-            .any(|r| r.start <= range.start && r.end >= range.end)
+            .get(idx)
+            .filter(|r| r.start <= range.start && r.end >= range.end)
+            .map(|_| idx)
     }
 
     fn iter(&self) -> impl Iterator<Item = (&Range<u64>, &Bytes)> {
@@ -168,26 +194,38 @@ impl PushBuffers {
     /// Clear any range and corresponding buffer that is exactly in the ranges_to_clear
     #[cfg(feature = "arrow")]
     pub(crate) fn clear_ranges(&mut self, ranges_to_clear: &[Range<u64>]) {
+        // Avoid quadratic membership checks when a request contains thousands
+        // of pages. Small requests do not need a membership-set allocation.
+        let range_set = (ranges_to_clear.len() > 8).then(|| {
+            ranges_to_clear
+                .iter()
+                .map(|r| (r.start, r.end))
+                .collect::<HashSet<_>>()
+        });
         let mut new_ranges = Vec::new();
         let mut new_buffers = Vec::new();
 
         for (range, buffer) in self.iter() {
-            if !ranges_to_clear
-                .iter()
-                .any(|r| r.start == range.start && r.end == range.end)
-            {
+            let remove = match &range_set {
+                Some(set) => set.contains(&(range.start, range.end)),
+                None => ranges_to_clear.iter().any(|r| r == range),
+            };
+            if !remove {
                 new_ranges.push(range.clone());
                 new_buffers.push(buffer.clone());
             }
         }
         self.ranges = new_ranges;
         self.buffers = new_buffers;
+        self.unordered = self.ranges.iter().any(|r| r.start > r.end)
+            || self.ranges.windows(2).any(|r| r[0].end > r[1].start);
     }
 
     /// Clear all buffered ranges and their corresponding data
     pub(crate) fn clear_all_ranges(&mut self) {
         self.ranges.clear();
         self.buffers.clear();
+        self.unordered = false;
     }
 }
 
@@ -200,20 +238,10 @@ impl Length for PushBuffers {
 /// less efficient implementation of Read for Buffers
 impl std::io::Read for PushBuffers {
     fn read(&mut self, buf: &mut [u8]) -> std::io::Result<usize> {
-        // Find the range that contains the start offset
-        let mut found = false;
-        for (range, data) in self.iter() {
-            if range.start <= self.offset && range.end >= self.offset + buf.len() as u64 {
-                // Found the range, figure out the starting offset in the buffer
-                let start_offset = (self.offset - range.start) as usize;
-                let end_offset = start_offset + buf.len();
-                let slice = data.slice(start_offset..end_offset);
-                buf.copy_from_slice(slice.as_ref());
-                found = true;
-                break;
-            }
-        }
-        if found {
+        let found = self.find_range(&(self.offset..self.offset + buf.len() as u64));
+        if let Some(idx) = found {
+            let start = (self.offset - self.ranges[idx].start) as usize;
+            buf.copy_from_slice(&self.buffers[idx][start..start + buf.len()]);
             // If we found the range, we can return the number of bytes read
             // advance our offset
             self.offset += buf.len() as u64;
@@ -235,13 +263,9 @@ impl ChunkReader for PushBuffers {
     }
 
     fn get_bytes(&self, start: u64, length: usize) -> Result<Bytes, ParquetError> {
-        // find the range that contains the start offset
-        for (range, data) in self.iter() {
-            if range.start <= start && range.end >= start + length as u64 {
-                // Found the range, figure out the starting offset in the buffer
-                let start_offset = (start - range.start) as usize;
-                return Ok(data.slice(start_offset..start_offset + length));
-            }
+        if let Some(idx) = self.find_range(&(start..start + length as u64)) {
+            let start_offset = (start - self.ranges[idx].start) as usize;
+            return Ok(self.buffers[idx].slice(start_offset..start_offset + length));
         }
         // Signal that we need more data
         let requested_end = start + length as u64;
@@ -252,6 +276,88 @@ impl ChunkReader for PushBuffers {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn lookup_preserves_first_containing_buffer() {
+        use std::io::Read;
+
+        // Includes adjacent, empty, disjoint, out-of-order and overlapping ranges.
+        for ranges in [
+            vec![0..0, 0..3, 3..3, 3..6, 9..12],
+            vec![9..12, 3..6, 0..3, 3..3],
+            vec![3..6, 0..12, 3..6, 4..5],
+        ] {
+            let mut buffers = PushBuffers::new(12);
+            for (idx, range) in ranges.iter().enumerate() {
+                buffers
+                    .push_range(
+                        range.clone(),
+                        Bytes::from(vec![idx as u8; (range.end - range.start) as usize]),
+                    )
+                    .unwrap();
+            }
+            for start in 0..=13 {
+                for end in start..=13 {
+                    let expected = ranges.iter().position(|r| r.start <= start && r.end >= end);
+                    assert_eq!(buffers.has_range(&(start..end)), expected.is_some());
+                    let result = buffers.get_bytes(start, (end - start) as usize);
+                    let mut reader = buffers.get_read(start).unwrap();
+                    let mut output = vec![0; (end - start) as usize];
+                    let read = reader.read(&mut output);
+                    match expected {
+                        Some(idx) => {
+                            let expected = vec![idx as u8; output.len()];
+                            assert_eq!(result.unwrap().as_ref(), expected);
+                            assert_eq!(read.unwrap(), expected.len());
+                            assert_eq!(output, expected);
+                        }
+                        None => {
+                            assert!(result.is_err());
+                            assert!(read.is_err());
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    #[cfg(feature = "arrow")]
+    #[test]
+    fn clear_many_ranges_preserves_unrequested_buffers() {
+        let mut buffers = PushBuffers::default();
+        // Overlapping preloaded data must survive clearing exact page ranges.
+        buffers
+            .push_range(0..100, Bytes::from(vec![42; 100]))
+            .unwrap();
+        for i in 0..100 {
+            buffers
+                .push_range(i..i + 1, Bytes::from(vec![i as u8]))
+                .unwrap();
+        }
+        let mut to_clear: Vec<_> = (0..100)
+            .rev()
+            .filter(|i| i % 2 == 0)
+            .map(|i| i..i + 1)
+            .collect();
+        to_clear.push(0..1); // duplicate requests are harmless
+        to_clear.push(200..201); // absent requests are harmless
+        buffers.clear_ranges(&to_clear);
+        assert_eq!(buffers.ranges.len(), 51);
+        assert_eq!(buffers.get_bytes(1, 1).unwrap().as_ref(), &[42]);
+        buffers.clear_ranges(std::slice::from_ref(&(0..100)));
+        assert!(!buffers.unordered);
+        assert!(!buffers.has_range(&(0..1)));
+        assert_eq!(buffers.get_bytes(1, 1).unwrap().as_ref(), &[1]);
+        assert_eq!(buffers.get_bytes(99, 1).unwrap().as_ref(), &[99]);
+        buffers.clear_ranges(&[]);
+        assert_eq!(buffers.ranges.len(), 50);
+        buffers.clear_all_ranges();
+        assert!(buffers.ranges.is_empty());
+        assert!(buffers.buffers.is_empty());
+        assert!(!buffers.unordered);
+        buffers.push_range(0..1, Bytes::from_static(b"a")).unwrap();
+        assert_eq!(buffers.get_bytes(0, 1).unwrap().as_ref(), b"a");
+    }
 
     #[test]
     fn push_range_accepts_matching_length() {
