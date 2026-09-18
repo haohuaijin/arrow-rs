@@ -170,6 +170,7 @@ impl PushBuffers {
             .map(|_| idx)
     }
 
+    #[cfg(feature = "arrow")]
     fn iter(&self) -> impl Iterator<Item = (&Range<u64>, &Bytes)> {
         self.ranges.iter().zip(self.buffers.iter())
     }
