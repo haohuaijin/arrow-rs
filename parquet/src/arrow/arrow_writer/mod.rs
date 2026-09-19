@@ -3629,6 +3629,62 @@ mod tests {
     }
 
     #[test]
+    fn test_column_data_page_row_count_limit() {
+        let schema = Arc::new(Schema::new(vec![
+            Field::new("required_limited", DataType::Int64, false),
+            Field::new("nullable_limited", DataType::Int64, true),
+            Field::new("unlimited", DataType::Int64, false),
+        ]));
+        let batch = RecordBatch::try_new(
+            schema.clone(),
+            vec![
+                Arc::new(Int64Array::from_iter_values(0..100)),
+                Arc::new(Int64Array::from_iter_values(0..100)),
+                Arc::new(Int64Array::from_iter_values(0..100)),
+            ],
+        )
+        .unwrap();
+
+        let data_pages = |props: WriterProperties| {
+            let mut out = Vec::with_capacity(1024);
+            let mut writer = ArrowWriter::try_new(&mut out, schema.clone(), Some(props)).unwrap();
+            writer.write(&batch).unwrap();
+            let metadata = writer.close().unwrap();
+            let page_index = metadata.page_index().expect("page index should be present");
+            (0..3)
+                .map(|col| page_index.num_data_pages(0, col).unwrap())
+                .collect::<Vec<_>>()
+        };
+
+        // a limit below the default write batch size (1024) still takes effect
+        let props = WriterProperties::builder()
+            .set_column_data_page_row_count_limit(ColumnPath::from("required_limited"), 10)
+            .set_column_data_page_row_count_limit(ColumnPath::from("nullable_limited"), 10)
+            .build();
+        assert_eq!(data_pages(props), vec![10, 10, 1]);
+
+        // limiting one column leaves the others alone
+        let props = WriterProperties::builder()
+            .set_column_data_page_row_count_limit(ColumnPath::from("nullable_limited"), 10)
+            .build();
+        assert_eq!(data_pages(props), vec![1, 10, 1]);
+
+        // a column override wins over the file wide limit in both directions
+        let props = WriterProperties::builder()
+            .set_data_page_row_count_limit(10)
+            .set_column_data_page_row_count_limit(ColumnPath::from("unlimited"), 1000)
+            .build();
+        assert_eq!(data_pages(props), vec![10, 10, 1]);
+
+        // a write batch that does not divide the limit overshoots by less than one batch
+        let props = WriterProperties::builder()
+            .set_write_batch_size(7)
+            .set_column_data_page_row_count_limit(ColumnPath::from("required_limited"), 10)
+            .build();
+        assert_eq!(data_pages(props), vec![8, 1, 1]);
+    }
+
+    #[test]
     fn check_page_offset_index_with_mixed_nan() {
         let schema = Arc::new(Schema::new(vec![Field::new(
             "col",

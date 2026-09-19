@@ -635,9 +635,13 @@ impl<'a, E: ColumnValueEncoder> GenericColumnWriter<'a, E> {
         // materialized slice to split and the per-mini-batch work is O(1), so we
         // can safely use a much larger batch size.
         let base_batch_size = if both_levels_compact && has_levels {
-            self.props.data_page_row_count_limit()
+            self.column_props.data_page_row_count_limit
         } else {
-            self.props.write_batch_size()
+            // The row count limit is only checked between mini-batches, so a
+            // mini-batch larger than the limit would overshoot it.
+            self.props
+                .write_batch_size()
+                .min(self.column_props.data_page_row_count_limit)
         };
         debug_assert!(base_batch_size > 0);
 
@@ -1210,7 +1214,7 @@ impl<'a, E: ColumnValueEncoder> GenericColumnWriter<'a, E> {
             return false;
         }
 
-        self.page_metrics.num_buffered_rows as usize >= self.props.data_page_row_count_limit()
+        self.page_metrics.num_buffered_rows as usize >= self.column_props.data_page_row_count_limit
             || self
                 .encoder
                 .estimated_data_page_size()
