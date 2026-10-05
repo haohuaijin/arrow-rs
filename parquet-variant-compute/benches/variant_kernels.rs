@@ -21,19 +21,21 @@ use arrow::array::{
 use arrow::buffer::Buffer;
 use arrow_schema::{DataType, Field, FieldRef, Fields};
 use chrono::{DateTime, NaiveDate, NaiveDateTime, NaiveTime};
-use criterion::{BatchSize, Criterion, criterion_group, criterion_main};
+use criterion::{BatchSize, Criterion, Throughput, criterion_group, criterion_main};
 use parquet_variant::{
     EMPTY_VARIANT_METADATA_BYTES, Variant, VariantBuilder, VariantBuilderExt, VariantDecimal8,
     VariantPath, VariantPathElement,
 };
 use parquet_variant_compute::{
     GetOptions, VariantArray, VariantArrayBuilder, json_to_variant, shred_variant, variant_get,
+    variant_to_json,
 };
 use parquet_variant_json::append_json;
 use rand::RngExt;
 use rand::SeedableRng;
 use rand::distr::Alphanumeric;
 use rand::rngs::StdRng;
+use rand::seq::SliceRandom;
 use serde_json::Value;
 use std::fmt::Write;
 use std::sync::Arc;
@@ -41,6 +43,74 @@ use std::sync::Arc;
 const VARIANT_GET_UNSHREDDED_OBJECT_ROWS: usize = 262_144;
 const VARIANT_ARRAY_BUILD_ROWS: usize = 262_144;
 const SHRED_VARIANT_OBJECT_ROWS: usize = 8_192;
+
+/// Benchmark serialization separately from input generation and Parquet I/O.
+fn variant_to_json_bench(c: &mut Criterion) {
+    let mut group = c.benchmark_group("variant_to_json");
+    for case in [
+        "same_keys",
+        "unique_keys",
+        "small_objects",
+        "nested_escaped",
+    ] {
+        let rows = if matches!(case, "small_objects" | "nested_escaped") {
+            2048
+        } else {
+            256
+        };
+        let mut rng = StdRng::seed_from_u64(20261003);
+        let documents: Vec<Option<String>> = (0..rows)
+            .map(|row| {
+                if case == "nested_escaped" {
+                    return (row % 17 != 0).then(|| {
+                        serde_json::json!({
+                            "a\"key\\\n": [null, true, row, -12345, 1.25, {"text": "café 😀\t\u{0001}\\\""}],
+                            "log": "hello world\nwith escapes\\and quotes\"".repeat(16),
+                            "values": (0..32).map(|i| serde_json::json!({"name": format!("node{i}"), "n": i})).collect::<Vec<_>>()
+                        }).to_string()
+                    });
+                }
+                let keys = if case == "small_objects" { 32 } else { 5000 };
+                let mut indices: Vec<usize> = (0..keys).collect();
+                indices.shuffle(&mut rng);
+                if keys == 5000 {
+                    indices.truncate(keys - rng.random_range(0..4000));
+                }
+                let mut object = serde_json::Map::new();
+                for k in indices {
+                    let key = if case == "unique_keys" {
+                        format!("field_row{row}_{k:04}")
+                    } else {
+                        format!("field_{k:04}")
+                    };
+                    let value = match k % 4 {
+                        0 if case == "unique_keys" => format!("val{k}").repeat(5),
+                        0 => format!("val{k}"),
+                        1 => (row * 1000 + k).to_string(),
+                        2 => (k as f64 * 0.01 + row as f64).to_string(),
+                        _ => (k % 2 == 0).to_string(),
+                    };
+                    object.insert(key, Value::String(value));
+                }
+                Some(Value::Object(object).to_string())
+            })
+            .collect();
+        let bytes = documents.iter().flatten().map(String::len).sum::<usize>();
+        let json: ArrayRef = Arc::new(StringArray::from_iter(
+            documents.iter().map(|document| document.as_deref()),
+        ));
+        let input = ArrayRef::from(json_to_variant(&json).unwrap());
+        let output = variant_to_json(&input).unwrap();
+        for (actual, expected) in output.iter().zip(&documents) {
+            assert_eq!(actual, expected.as_deref());
+        }
+        group.throughput(Throughput::Bytes(bytes as u64));
+        group.bench_function(case, |b| {
+            b.iter(|| variant_to_json(std::hint::black_box(&input)).unwrap());
+        });
+    }
+    group.finish();
+}
 
 fn variant_array_builder_build_bench(c: &mut Criterion) {
     c.bench_function("variant_array_builder_build_262k_small_values", |b| {
@@ -473,6 +543,7 @@ pub fn variant_get_binary_from_string_bench(c: &mut Criterion) {
 
 criterion_group!(
     benches,
+    variant_to_json_bench,
     variant_get_bench,
     variant_get_shredded_utf8_bench,
     variant_get_unshredded_object_path_bench,

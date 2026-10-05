@@ -168,9 +168,9 @@ pub trait VariantToJson {
 impl VariantToJson for Variant<'_, '_> {
     fn to_json(&self, buffer: &mut impl Write) -> Result<(), ArrowError> {
         match self {
-            Variant::Null => write!(buffer, "null")?,
-            Variant::BooleanTrue => write!(buffer, "true")?,
-            Variant::BooleanFalse => write!(buffer, "false")?,
+            Variant::Null => buffer.write_all(b"null")?,
+            Variant::BooleanTrue => buffer.write_all(b"true")?,
+            Variant::BooleanFalse => buffer.write_all(b"false")?,
             Variant::Int8(i) => write!(buffer, "{i}")?,
             Variant::Int16(i) => write!(buffer, "{i}")?,
             Variant::Int32(i) => write!(buffer, "{i}")?,
@@ -194,25 +194,10 @@ impl VariantToJson for Variant<'_, '_> {
             Variant::Binary(bytes) => {
                 // Encode binary as base64 string
                 let base64_str = format_binary_base64(bytes);
-                let json_str = serde_json::to_string(&base64_str).map_err(|e| {
-                    ArrowError::InvalidArgumentError(format!("JSON encoding error: {e}"))
-                })?;
-                write!(buffer, "{json_str}")?
+                write_json_string(buffer, &base64_str)?;
             }
-            Variant::String(s) => {
-                // Use serde_json to properly escape the string
-                let json_str = serde_json::to_string(s).map_err(|e| {
-                    ArrowError::InvalidArgumentError(format!("JSON encoding error: {e}"))
-                })?;
-                write!(buffer, "{json_str}")?
-            }
-            Variant::ShortString(s) => {
-                // Use serde_json to properly escape the string
-                let json_str = serde_json::to_string(s.as_str()).map_err(|e| {
-                    ArrowError::InvalidArgumentError(format!("JSON encoding error: {e}"))
-                })?;
-                write!(buffer, "{json_str}")?
-            }
+            Variant::String(s) => write_json_string(buffer, s)?,
+            Variant::ShortString(s) => write_json_string(buffer, s.as_str())?,
             Variant::Uuid(uuid) => {
                 write!(buffer, "\"{uuid}\"")?;
             }
@@ -335,6 +320,14 @@ impl VariantToJson for Variant<'_, '_> {
     }
 }
 
+/// Escape strings directly into the output, without allocating an intermediate JSON string.
+fn write_json_string(buffer: &mut impl Write, value: &str) -> Result<(), ArrowError> {
+    // Serializing a str can only fail on I/O. Recover the original writer error so callers
+    // continue to receive ArrowError::IoError, including its error kind and source.
+    serde_json::to_writer(buffer, value).map_err(std::io::Error::from)?;
+    Ok(())
+}
+
 // Format string constants to avoid duplication and reduce errors
 const DATE_FORMAT: &str = "%Y-%m-%d";
 
@@ -367,46 +360,43 @@ fn format_time_ntz_str(time: &chrono::NaiveTime) -> String {
 
 /// Convert object fields to JSON
 fn convert_object_to_json(buffer: &mut impl Write, obj: &VariantObject) -> Result<(), ArrowError> {
-    write!(buffer, "{{")?;
+    buffer.write_all(b"{")?;
 
     // Get all fields from the object
     let mut first = true;
 
     for (key, value) in obj.iter() {
         if !first {
-            write!(buffer, ",")?;
+            buffer.write_all(b",")?;
         }
         first = false;
 
-        // Write the key (properly escaped)
-        let json_key = serde_json::to_string(key).map_err(|e| {
-            ArrowError::InvalidArgumentError(format!("JSON key encoding error: {e}"))
-        })?;
-        write!(buffer, "{json_key}:")?;
+        write_json_string(buffer, key)?;
+        buffer.write_all(b":")?;
 
         // Recursively convert the value
         value.to_json(buffer)?;
     }
 
-    write!(buffer, "}}")?;
+    buffer.write_all(b"}")?;
     Ok(())
 }
 
 /// Convert array elements to JSON
 fn convert_array_to_json(buffer: &mut impl Write, arr: &VariantList) -> Result<(), ArrowError> {
-    write!(buffer, "[")?;
+    buffer.write_all(b"[")?;
 
     let mut first = true;
     for element in arr.iter() {
         if !first {
-            write!(buffer, ",")?;
+            buffer.write_all(b",")?;
         }
         first = false;
 
         element.to_json(buffer)?;
     }
 
-    write!(buffer, "]")?;
+    buffer.write_all(b"]")?;
     Ok(())
 }
 
@@ -415,6 +405,115 @@ mod tests {
     use super::*;
     use chrono::{DateTime, NaiveDate, NaiveTime, Utc};
     use parquet_variant::{VariantDecimal4, VariantDecimal8, VariantDecimal16};
+
+    #[test]
+    fn test_string_control_character_escaping() {
+        let text: String = (0..32).map(char::from).collect();
+        let expected = serde_json::to_string(&text).unwrap();
+        assert_eq!(Variant::String(&text).to_json_string().unwrap(), expected);
+        for character in text.chars() {
+            let text = character.to_string();
+            let expected = serde_json::to_string(&text).unwrap();
+            assert_eq!(
+                Variant::from(text.as_str()).to_json_string().unwrap(),
+                expected
+            );
+        }
+    }
+
+    struct ShortWriter {
+        output: Vec<u8>,
+        max_write: usize,
+    }
+
+    impl Write for ShortWriter {
+        fn write(&mut self, bytes: &[u8]) -> std::io::Result<usize> {
+            let len = bytes.len().min(self.max_write);
+            self.output.extend_from_slice(&bytes[..len]);
+            Ok(len)
+        }
+
+        fn flush(&mut self) -> std::io::Result<()> {
+            Ok(())
+        }
+    }
+
+    #[test]
+    fn test_to_json_short_writes() -> Result<(), ArrowError> {
+        use crate::JsonToVariant;
+        use parquet_variant::VariantBuilder;
+
+        let document =
+            r#"{"a\"key\\":["short","long string with café 😀 and \n\t\u0000",null,true,42]}"#;
+        let mut builder = VariantBuilder::new();
+        builder.append_json(document)?;
+        let (metadata, value) = builder.finish();
+        let variant = Variant::try_new(&metadata, &value)?;
+        let expected =
+            serde_json::to_vec(&serde_json::from_str::<Value>(document).unwrap()).unwrap();
+        for max_write in [1, 2, 7] {
+            let mut writer = ShortWriter {
+                output: Vec::new(),
+                max_write,
+            };
+            variant.to_json(&mut writer)?;
+            assert_eq!(writer.output, expected);
+        }
+        Ok(())
+    }
+
+    struct FailingWriter {
+        remaining: usize,
+    }
+
+    impl Write for FailingWriter {
+        fn write(&mut self, bytes: &[u8]) -> std::io::Result<usize> {
+            if self.remaining == 0 {
+                return Err(std::io::Error::new(
+                    std::io::ErrorKind::BrokenPipe,
+                    "writer failure",
+                ));
+            }
+            let written = bytes.len().min(self.remaining);
+            self.remaining -= written;
+            Ok(written)
+        }
+
+        fn flush(&mut self) -> std::io::Result<()> {
+            Ok(())
+        }
+    }
+
+    #[test]
+    fn test_to_json_preserves_io_errors() -> Result<(), ArrowError> {
+        use parquet_variant::VariantBuilder;
+
+        let mut builder = VariantBuilder::new();
+        builder
+            .new_object()
+            .with_field("escaped\"key", "value\\\n")
+            .finish();
+        let (metadata, value) = builder.finish();
+        let object = Variant::try_new(&metadata, &value)?;
+        for variant in [
+            Variant::from("short"),
+            Variant::String("long string with escaped \" text and café"),
+            Variant::Binary(b"binary value"),
+            object,
+        ] {
+            for remaining in 0..variant.to_json_string()?.len() {
+                let error = variant
+                    .to_json(&mut FailingWriter { remaining })
+                    .unwrap_err();
+                let ArrowError::IoError(_, source) = error else {
+                    panic!("Expected writer I/O error, got {error}");
+                };
+                assert_eq!(source.kind(), std::io::ErrorKind::BrokenPipe);
+                assert_eq!(source.to_string(), "writer failure");
+            }
+        }
+        Ok(())
+    }
 
     #[test]
     fn test_decimal_edge_cases() -> Result<(), ArrowError> {
