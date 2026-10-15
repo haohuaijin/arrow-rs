@@ -350,6 +350,45 @@ impl<'a> BitChunks<'a> {
         unsafe { read_chunk(self.buffer, self.bit_offset, index) }
     }
 
+    /// Reads a 64-bit window starting at `position` bits into this buffer.
+    ///
+    /// Returns `None` if the 16-byte window used for this read crosses the end
+    /// of the backing bytes. Bits beyond this buffer's logical length may be
+    /// returned, and must be ignored by the caller. Use [`Self::read_at_padded`]
+    /// when bits beyond the logical length must be zero.
+    ///
+    /// `position` must not exceed this buffer's logical length.
+    #[inline]
+    pub fn read_at_raw(&self, position: usize) -> Option<u64> {
+        debug_assert!(position <= self.chunk_len * 64 + self.remainder_len);
+        let position = self.bit_offset + position;
+        let window = self.buffer.get(position / 8..)?.first_chunk::<16>()?;
+        Some((u128::from_le_bytes(*window) >> (position % 8)) as u64)
+    }
+
+    /// Reads up to 64 bits starting at `position`, padding beyond this buffer's
+    /// logical length with zeros.
+    ///
+    /// # Panics
+    ///
+    /// Panics if `position` exceeds the logical length of this buffer.
+    // Keep the tail path out of callers that repeatedly use `read_at_raw` in a hot loop.
+    #[inline(never)]
+    pub fn read_at_padded(&self, position: usize) -> u64 {
+        let len = self.chunk_len * 64 + self.remainder_len;
+        assert!(position <= len, "bit position out of bounds");
+        let remaining = (len - position).min(64);
+        if remaining == 0 {
+            return 0;
+        }
+        let tail = Self::new(self.buffer, self.bit_offset + position, remaining);
+        if remaining == 64 {
+            tail.chunk(0)
+        } else {
+            tail.remainder_bits()
+        }
+    }
+
     /// Returns an iterator over chunks of 64 bits represented as an `u64`
     #[inline]
     pub const fn iter(&self) -> BitChunkIterator<'a> {
@@ -463,7 +502,7 @@ mod tests {
     use rand::rng;
 
     use crate::buffer::Buffer;
-    use crate::util::bit_chunk_iterator::UnalignedBitChunk;
+    use crate::util::bit_chunk_iterator::{BitChunks, UnalignedBitChunk};
 
     #[test]
     fn test_iter_aligned() {
@@ -580,6 +619,36 @@ mod tests {
                         Some(bitchunks.chunk(index)),
                         "offset {offset} len {len} chunk {index}"
                     );
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn test_read_at_padded() {
+        let input: Vec<u8> = (0..26_u8).map(|i| i.wrapping_mul(37)).collect();
+        for offset in 0..8 {
+            for len in [0, 1, 7, 8, 63, 64, 65, 127, 128, 129, 191, 192] {
+                let chunks = BitChunks::new(&input, offset, len);
+                for position in 0..=len {
+                    let remaining = (len - position).min(64);
+                    let expected = (0..remaining).fold(0_u64, |bits, i| {
+                        let bit = offset + position + i;
+                        bits | ((((input[bit / 8] >> (bit % 8)) & 1) as u64) << i)
+                    });
+                    assert_eq!(chunks.read_at_padded(position), expected);
+
+                    let has_window = (offset + position) / 8 + 16 <= input.len();
+                    let raw = chunks.read_at_raw(position);
+                    assert_eq!(raw.is_some(), has_window);
+                    if let Some(raw) = raw {
+                        let mask = if remaining == 64 {
+                            u64::MAX
+                        } else {
+                            (1 << remaining) - 1
+                        };
+                        assert_eq!(raw & mask, expected);
+                    }
                 }
             }
         }

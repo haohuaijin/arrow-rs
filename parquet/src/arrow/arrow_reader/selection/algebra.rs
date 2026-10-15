@@ -484,7 +484,7 @@ fn and_then_sparse_masks(mask: &BooleanBuffer, other: &BooleanBuffer) -> Boolean
 fn and_then_dense_masks(mask: &BooleanBuffer, other: &BooleanBuffer) -> BooleanBuffer {
     debug_assert_eq!(other.len(), mask.count_set_bits());
 
-    let other_bits = BitReader::new(other);
+    let other_bits = other.bit_chunks();
     let mut output = MutableBuffer::from_len_zeroed(mask.len().div_ceil(64) * 8);
     let mut words = output
         .typed_data_mut::<u64>()
@@ -494,8 +494,9 @@ fn and_then_dense_masks(mask: &BooleanBuffer, other: &BooleanBuffer) -> BooleanB
 
     // A word's read depends only on `position`, not on the previous deposit, so consecutive
     // words overlap. Bits of `source` past the `count` taken ones are ignored by `deposit`.
-    // Reads that would run past the backing bytes go to the loop below.
-    while let Some(source) = other_bits.read(position) {
+    // Raw reads may cross the logical length; `deposit` ignores the unused high bits.
+    // Reads that cross the backing bytes go to the loop below.
+    while let Some(source) = other_bits.read_at_raw(position) {
         let Some((slot, mask_word)) = words.next() else {
             break;
         };
@@ -504,7 +505,12 @@ fn and_then_dense_masks(mask: &BooleanBuffer, other: &BooleanBuffer) -> BooleanB
         position += count;
     }
     for (slot, mask_word) in words {
-        let (word, count) = deposit(other_bits.read_padded(position), mask_word);
+        // The output was zero-initialized, and no later mask word can have set bits once all
+        // source bits have been consumed.
+        if position == other.len() {
+            break;
+        }
+        let (word, count) = deposit(other_bits.read_at_padded(position), mask_word);
         *slot = word;
         position += count;
     }
@@ -539,54 +545,6 @@ fn deposit(source: u64, mask_word: u64) -> (u64, usize) {
         bit_util::expand(source, mask_word),
         mask_word.count_ones() as usize,
     )
-}
-
-/// Reads 64 bits of a [`BooleanBuffer`] from any bit position.
-struct BitReader<'a> {
-    bytes: &'a [u8],
-    offset: usize,
-    /// The last 16 backing bytes followed by zeros, for the reads that run past the end. These
-    /// can be many: once a mask runs out of set bits, every remaining word reads at the end.
-    tail: [u8; 32],
-    tail_start: usize,
-}
-
-impl<'a> BitReader<'a> {
-    fn new(buffer: &'a BooleanBuffer) -> Self {
-        let bytes = buffer.values();
-        let tail_start = bytes.len().saturating_sub(16);
-        let mut tail = [0; 32];
-        tail[..bytes.len() - tail_start].copy_from_slice(&bytes[tail_start..]);
-        Self {
-            bytes,
-            offset: buffer.offset(),
-            tail,
-            tail_start,
-        }
-    }
-
-    /// The 64 bits from `position` on, or `None` if the 16 bytes holding them run past the
-    /// backing bytes. Bits past the buffer's length are whatever the backing bytes hold.
-    #[inline]
-    fn read(&self, position: usize) -> Option<u64> {
-        let position = self.offset + position;
-        // 16 bytes from the byte holding `position` cover 64 bits past any shift of up to 7.
-        let window = self.bytes.get(position / 8..)?.first_chunk::<16>()?;
-        Some((u128::from_le_bytes(*window) >> (position % 8)) as u64)
-    }
-
-    /// Same as [`Self::read`] for the positions it refuses, with bits past the backing bytes
-    /// read as zero.
-    #[inline]
-    fn read_padded(&self, position: usize) -> u64 {
-        let position = self.offset + position;
-        let window = self
-            .tail
-            .get(position / 8 - self.tail_start..)
-            .and_then(<[u8]>::first_chunk::<16>)
-            .unwrap_or(&[0; 16]);
-        (u128::from_le_bytes(*window) >> (position % 8)) as u64
-    }
 }
 
 #[cfg(test)]
